@@ -11,11 +11,14 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <vector>
 
+#include <poet/poet.hpp>
 #include <polyfit/polyeval.hpp>
 
 // ---------------------------------------------------------------------------
@@ -64,15 +67,116 @@ struct TreeInput {
     int     min_depth             = 0;
     int     max_depth             = 50;
     int     n_samples_per_dim     = 8;
+    /// Soft cap on accumulated leaf storage, in MiB. The fit aborts with
+    /// `MemoryBudgetExceeded` once `polyfits.size() * sizeof(poly_eval_type)`
+    /// crosses this. Set to 0 to disable. Default 1 GiB matches the common
+    /// case where a runaway fit is more likely a programming mistake than a
+    /// genuine need; raise it explicitly for ambitious fits.
+    int     max_memory_mib        = 1024;
     TolKind tol_kind              = TolKind::RelativeMax;
 };
 } // namespace detail
 
+/// Thrown when adaptive paneling hits `options.max_depth` without converging.
+/// Carries the offending panel as a half-open domain [a, b) and the depth,
+/// so callers can identify the singular region — typically a latent
+/// singularity in the function that sampling alone cannot resolve.
 class MaxDepthExceeded : public std::exception {
   public:
-    const char *what() const noexcept override {
-        return "Baobzi fit error: tree depth exceeded max allowed input depth";
+    MaxDepthExceeded() = default;
+
+    template <class VecC, class VecH>
+    MaxDepthExceeded(std::size_t depth, const VecC &center_in, const VecH &half_length_in)
+        : depth_(depth) {
+        auto cit = center_in.begin();
+        auto hit = half_length_in.begin();
+        for (; cit != center_in.end() && hit != half_length_in.end(); ++cit, ++hit) {
+            a_.push_back(*cit - *hit);
+            b_.push_back(*cit + *hit);
+        }
+        std::ostringstream os;
+        os << "Baobzi fit error: tree depth exceeded max allowed input depth ("
+           << depth_ << ") on panel ";
+        format_domain(os);
+        os << " — likely a singularity in this interval; "
+              "subdivide manually away from the singularity or raise options.max_depth.";
+        msg_ = os.str();
     }
+
+    std::size_t                depth() const noexcept { return depth_; }
+    /// Lower bound(s) of the offending half-open panel [a, b).
+    const std::vector<double> &a()     const noexcept { return a_; }
+    /// Upper bound(s) of the offending half-open panel [a, b).
+    const std::vector<double> &b()     const noexcept { return b_; }
+    const char                *what()  const noexcept override { return msg_.c_str(); }
+
+  private:
+    std::size_t         depth_ = 0;
+    std::vector<double> a_;
+    std::vector<double> b_;
+    std::string         msg_ =
+        "Baobzi fit error: tree depth exceeded max allowed input depth";
+
+    void format_domain(std::ostringstream &os) const {
+        if (a_.size() == 1) {
+            os << "[" << a_[0] << ", " << b_[0] << ")";
+            return;
+        }
+        os << "[";
+        for (std::size_t i = 0; i < a_.size(); ++i)
+            os << (i ? " x " : "") << "[" << a_[i] << ", " << b_[i] << ")";
+        os << "]";
+    }
+};
+
+/// Thrown when adaptive paneling pushes accumulated leaf storage past
+/// `options.max_memory_mib`. Carries the amount used, the budget, and the
+/// offending half-open panel [a, b) — the same shape as `MaxDepthExceeded`
+/// — so callers can either raise the budget or excise the singular region.
+class MemoryBudgetExceeded : public std::exception {
+  public:
+    MemoryBudgetExceeded() = default;
+
+    template <class VecC, class VecH>
+    MemoryBudgetExceeded(std::size_t used_bytes, std::size_t budget_bytes,
+                         const VecC &center_in, const VecH &half_length_in)
+        : used_bytes_(used_bytes), budget_bytes_(budget_bytes) {
+        auto cit = center_in.begin();
+        auto hit = half_length_in.begin();
+        for (; cit != center_in.end() && hit != half_length_in.end(); ++cit, ++hit) {
+            a_.push_back(*cit - *hit);
+            b_.push_back(*cit + *hit);
+        }
+        std::ostringstream os;
+        os << "Baobzi fit error: leaf-storage exceeded budget ("
+           << (static_cast<double>(used_bytes_)   / (1024.0 * 1024.0)) << " MiB used vs "
+           << (static_cast<double>(budget_bytes_) / (1024.0 * 1024.0)) << " MiB budget) on panel ";
+        if (a_.size() == 1)
+            os << "[" << a_[0] << ", " << b_[0] << ")";
+        else {
+            os << "[";
+            for (std::size_t i = 0; i < a_.size(); ++i)
+                os << (i ? " x " : "") << "[" << a_[i] << ", " << b_[i] << ")";
+            os << "]";
+        }
+        os << " — raise options.max_memory_mib (or set to 0 to disable), "
+              "or restrict the fit domain to skip this region.";
+        msg_ = os.str();
+    }
+
+    std::size_t                used_bytes()   const noexcept { return used_bytes_; }
+    std::size_t                budget_bytes() const noexcept { return budget_bytes_; }
+    const std::vector<double> &a()            const noexcept { return a_; }
+    const std::vector<double> &b()            const noexcept { return b_; }
+    const char                *what()         const noexcept override { return msg_.c_str(); }
+
+  private:
+    std::size_t         used_bytes_   = 0;
+    std::size_t         budget_bytes_ = 0;
+    std::vector<double> a_;
+    std::vector<double> b_;
+    std::string         msg_ =
+        "Baobzi fit error: leaf-storage exceeded budget";
 };
 
 namespace detail {
@@ -421,8 +525,8 @@ class Node {
     using output_type = typename poly_eval::function_traits<Func>::result_type;
     using value_type = typename value_type_or_identity<input_type>::type;
     using poly_eval_type =
-        typename std::conditional<has_tuple_size_v<input_type>, poly_eval::FuncEvalND<Func, Degree>,
-                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Auto>>::type;
+        typename std::conditional<has_tuple_size_v<input_type>, poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never>,
+                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never>>::type;
 
     static constexpr std::size_t input_dim = get_tuple_size<input_type>();
     static constexpr std::size_t output_dim = get_tuple_size<output_type>();
@@ -478,8 +582,8 @@ struct PolyTree {
     using input_type = std::remove_cvref_t<typename poly_eval::function_traits<Func>::arg0_type>;
     using value_type = typename value_type_or_identity<input_type>::type;
     using poly_eval_type =
-        typename std::conditional<has_tuple_size_v<input_type>, poly_eval::FuncEvalND<Func, Degree>,
-                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Auto>>::type;
+        typename std::conditional<has_tuple_size_v<input_type>, poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never>,
+                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never>>::type;
     using output_type = typename poly_eval::function_traits<Func>::result_type;
 
     static constexpr std::size_t output_dim = get_tuple_size<output_type>();
@@ -534,8 +638,26 @@ struct PolyTree {
 
             if (!q.empty())
                 ++max_depth_;
-            if (max_depth_ > static_cast<std::size_t>(input.max_depth))
-                throw MaxDepthExceeded();
+            if (max_depth_ > static_cast<std::size_t>(input.max_depth)) {
+                // q.front() is the first unfitted box at the depth that blew
+                // up — identifies the smallest interval we tried (and failed)
+                // to fit, which is where the singularity lives.
+                const auto &offender = q.front();
+                throw MaxDepthExceeded(max_depth_, offender.center.as_array(),
+                                       offender.half_length.as_array());
+            }
+            if (input.max_memory_mib > 0 && !q.empty()) {
+                const std::size_t budget =
+                    static_cast<std::size_t>(input.max_memory_mib) * std::size_t{1024} * std::size_t{1024};
+                const std::size_t used = polyfits.size() * sizeof(poly_eval_type)
+                                       + nodes_.size() * sizeof(node_t);
+                if (used > budget) {
+                    const auto &offender = q.front();
+                    throw MemoryBudgetExceeded(used, budget,
+                                               offender.center.as_array(),
+                                               offender.half_length.as_array());
+                }
+            }
 
             half_width = half_width * value_type{0.5};
         }
@@ -555,7 +677,11 @@ struct PolyTree {
             else
                 child_idx = static_cast<index_t>(x > nodes_[curr_index].center[0]);
 
-            curr_index = nodes_[curr_index].first_child_idx + child_idx;
+            const index_t next = nodes_[curr_index].first_child_idx + child_idx;
+#if defined(__GNUC__) || defined(__clang__)
+            __builtin_prefetch(&nodes_[next]);
+#endif
+            curr_index = next;
         }
 
         return curr_index;
@@ -582,15 +708,15 @@ struct PolyTree {
 
 /// Represents a function over some domain as a grid of baobzi::detail::PolyTree
 /// objects.
-template <std::size_t Degree, class Func, bool SplitMultiEval>
+template <std::size_t Degree, class Func>
 class Function {
   public:
     using input_type = std::remove_cvref_t<typename poly_eval::function_traits<Func>::arg0_type>;
     using output_type = typename poly_eval::function_traits<Func>::result_type;
     using value_type = typename value_type_or_identity<input_type>::type;
     using poly_eval_type =
-        typename std::conditional<has_tuple_size_v<input_type>, poly_eval::FuncEvalND<Func, Degree>,
-                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Auto>>::type;
+        typename std::conditional<has_tuple_size_v<input_type>, poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never>,
+                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never>>::type;
     static constexpr auto degree = Degree;
 
     static constexpr std::size_t input_dim = detail::get_tuple_size<input_type>();
@@ -718,8 +844,12 @@ class Function {
             if (expected_full == q.size()) {
                 n_subtrees_ = n_subtrees_ * std::size_t{2};
                 ++stats_.base_depth;
-                if (stats_.base_depth > static_cast<std::size_t>(input.max_depth))
-                    throw MaxDepthExceeded();
+                if (stats_.base_depth > static_cast<std::size_t>(input.max_depth)) {
+                    const auto &offender = q.front();
+                    throw MaxDepthExceeded(stats_.base_depth,
+                                           offender.center.as_array(),
+                                           offender.half_length.as_array());
+                }
             } else {
                 break;
             }
@@ -838,37 +968,156 @@ class Function {
     }
 
     /// Batch evaluation: n_trg points written into res.
+    ///
+    /// Fast path groups points by owning leaf via counting sort, then invokes
+    /// polyfit's SIMD batch kernel once per leaf. Scalar per-point traversal
+    /// is kept for tiny batches where the sort cannot amortize.
     inline void operator()(const value_type *xp, value_type *res, std::size_t n_trg) const {
-        if constexpr (SplitMultiEval) {
-            if (n_trg > 1) {
-                std::vector<std::pair<node_t *, input_type>> node_map(n_trg);
-                for (std::size_t i = 0; i < n_trg; ++i) {
-                    const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
-                    node_t *node_ptr = [this, xi]() -> node_t * {
-                        for (std::size_t dim = 0; dim < input_dim; ++dim)
-                            if (xi[dim] < lower_left_[dim] || xi[dim] >= upper_right_[dim])
-                                return nullptr;
+        if (n_trg == 0) return;
+        if (n_trg == 1) {
+            const detail::Value<value_type, input_dim> xi(xp);
+            const detail::Value<value_type, output_dim> tmp = (*this)(xi);
+            std::copy(tmp.begin(), tmp.end(), res);
+            return;
+        }
 
-                        return node_pointers_[get_global_node_index(xi)];
-                    }();
+        // Below this point the counting-sort overhead likely exceeds the
+        // SIMD gain — fall through to scalar per-point.
+        constexpr std::size_t kSortThreshold = 32;
+        if (n_trg < kSortThreshold) {
+            for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
+                const detail::Value<value_type, input_dim> xi(xp + input_dim * i_trg);
+                const detail::Value<value_type, output_dim> tmp = (*this)(xi);
+                std::copy(tmp.begin(), tmp.end(), res + i_trg * output_dim);
+            }
+            return;
+        }
 
-                    node_map[i] = std::make_pair(node_ptr, xi);
-                }
+        const std::uint32_t n_leaves = static_cast<std::uint32_t>(polyfits_.size());
+        const std::uint32_t ood_id = n_leaves; // sentinel bucket for out-of-domain
 
-                for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
-                    const detail::Value<value_type, output_dim> tmp =
-                        node_map[i_trg].first == nullptr
-                            ? output_type{NAN}
-                            : polyfits_[node_map[i_trg].first->poly_eval_id](node_map[i_trg].second);
-                    std::copy(tmp.begin(), tmp.end(), res + i_trg * output_dim);
-                }
-                return;
+        // Thread-local scratch reused across calls. Vectors amortize their
+        // capacity so steady-state eval does no heap allocation.
+        thread_local std::vector<std::uint32_t> leaf_ids;
+        thread_local std::vector<std::uint32_t> counts;
+        thread_local std::vector<std::uint32_t> offsets;
+        thread_local std::vector<std::uint32_t> perm;
+        thread_local std::vector<value_type>    xp_packed;
+        thread_local std::vector<value_type>    out_packed;
+
+        leaf_ids.resize(n_trg);
+        counts.assign(n_leaves + 1, 0);
+        perm.resize(n_trg);
+        xp_packed.resize(input_dim * n_trg);
+        out_packed.resize(output_dim * n_trg);
+
+        // Traversal: leaf id per point + population histogram.
+        for (std::size_t i = 0; i < n_trg; ++i) {
+            const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
+            bool in_domain = true;
+            poet::static_for<input_dim>([&](auto D) {
+                constexpr std::size_t d = D;
+                if (xi[d] < lower_left_[d] || xi[d] >= upper_right_[d])
+                    in_domain = false;
+            });
+            const std::uint32_t id = in_domain
+                ? static_cast<std::uint32_t>(
+                      node_pointers_[get_global_node_index(xi)]->poly_eval_id)
+                : ood_id;
+            leaf_ids[i] = id;
+            ++counts[id];
+        }
+
+        // Prefix sum — offsets[k] is the packed-buffer start for leaf k.
+        offsets.resize(n_leaves + 1);
+        {
+            std::uint32_t run = 0;
+            for (std::uint32_t k = 0; k <= n_leaves; ++k) {
+                offsets[k] = run;
+                run += counts[k];
             }
         }
-        for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
-            const detail::Value<value_type, input_dim> xi(xp + input_dim * i_trg);
-            const detail::Value<value_type, output_dim> tmp = (*this)(xi);
-            std::copy(tmp.begin(), tmp.end(), res + i_trg * output_dim);
+
+        // Scatter inputs to packed layout. offsets[] is consumed as a cursor;
+        // rebuilt from counts afterwards for the per-leaf dispatch.
+        for (std::size_t i = 0; i < n_trg; ++i) {
+            const std::uint32_t id = leaf_ids[i];
+            const std::uint32_t dst = offsets[id]++;
+            perm[dst] = static_cast<std::uint32_t>(i);
+            if constexpr (input_dim == 1) {
+                xp_packed[dst] = xp[i];
+            } else {
+                const value_type *src = xp + input_dim * i;
+                value_type *dstp = xp_packed.data() + input_dim * dst;
+                poet::static_for<input_dim>([&](auto D) {
+                    constexpr std::size_t d = D;
+                    dstp[d] = src[d];
+                });
+            }
+        }
+        {
+            std::uint32_t run = 0;
+            for (std::uint32_t k = 0; k <= n_leaves; ++k) {
+                offsets[k] = run;
+                run += counts[k];
+            }
+        }
+
+        // Per-leaf SIMD batch eval. Speculative prefetch of the next
+        // non-empty leaf's coefficient store hides cacheline-fill latency
+        // when leaves are small relative to the working set.
+        for (std::uint32_t id = 0; id < n_leaves; ++id) {
+            const std::uint32_t cnt = counts[id];
+            if (cnt == 0) continue;
+            const std::uint32_t off = offsets[id];
+#if defined(__GNUC__) || defined(__clang__)
+            std::uint32_t next_id = id + 1;
+            while (next_id < n_leaves && counts[next_id] == 0) ++next_id;
+            if (next_id < n_leaves) {
+                if constexpr (has_tuple_size_v<input_type>) {
+                    // ND: polyfit doesn't expose a coefficient pointer; the
+                    // evaluator object's first cacheline contains domain
+                    // params and (on default layouts) the start of coeffsFlat.
+                    __builtin_prefetch(&polyfits_[next_id]);
+                } else {
+                    __builtin_prefetch(polyfits_[next_id].coeffs().data());
+                }
+            }
+#endif
+            if constexpr (has_tuple_size_v<input_type>) {
+                using CI = typename poly_eval_type::CanonicalInput;
+                using CO = typename poly_eval_type::CanonicalOutput;
+                const CI *pts = reinterpret_cast<const CI *>(
+                    xp_packed.data() + input_dim * off);
+                CO *outs = reinterpret_cast<CO *>(
+                    out_packed.data() + output_dim * off);
+                polyfits_[id](pts, outs, static_cast<std::size_t>(cnt));
+            } else {
+                polyfits_[id](xp_packed.data() + off,
+                              out_packed.data() + off,
+                              static_cast<std::size_t>(cnt));
+            }
+        }
+
+        // Fill OOD slots with NaN.
+        const std::uint32_t ood_cnt = counts[ood_id];
+        if (ood_cnt) {
+            const std::uint32_t off = offsets[ood_id];
+            constexpr value_type nan_v = std::numeric_limits<value_type>::quiet_NaN();
+            for (std::uint32_t k = 0; k < ood_cnt; ++k)
+                for (std::size_t j = 0; j < output_dim; ++j)
+                    out_packed[output_dim * (off + k) + j] = nan_v;
+        }
+
+        // Permute outputs back to caller order.
+        for (std::size_t dst = 0; dst < n_trg; ++dst) {
+            const std::uint32_t src = perm[dst];
+            const value_type *srcp = out_packed.data() + output_dim * dst;
+            value_type *dstp = res + output_dim * src;
+            poet::static_for<output_dim>([&](auto J) {
+                constexpr std::size_t j = J;
+                dstp[j] = srcp[j];
+            });
         }
     }
 

@@ -8,21 +8,20 @@
 #include <vector>
 
 int main() {
-    auto bump = [](std::array<double, 2> x) -> std::array<double, 1> {
-        return {std::exp(-100.0 * (x[0] - 0.5) * (x[0] - 0.5)
-                         - (x[1] - 0.5) * (x[1] - 0.5))};
+    auto gaussian = [](std::array<double, 3> x) -> std::array<double, 1> {
+        return {std::exp(-0.5 * x[0] * x[0] - 1.5 * x[1] * x[1]
+                         - 2.0 * x[2] * x[2])};
     };
-    auto fn = baobzi::fit(bump,
-                          std::array{0.0, 0.0},
-                          std::array{1.0, 1.0},
-                          /*tol=*/1e-8,
-                          baobzi::options{}, baobzi::SplitMultiEvalOff);
+    auto fn = baobzi::fit(gaussian,
+                          std::array{-1.0, -1.0, -1.0},
+                          std::array{1.0, 1.0, 1.0},
+                          /*tol=*/1e-8);
 
     std::mt19937 gen(1);
-    std::uniform_real_distribution<double> d(0.001, 0.999);
-    constexpr int N = 500'000;
-    std::vector<std::array<double, 2>> xs(N);
-    for (auto &x : xs) x = {d(gen), d(gen)};
+    std::uniform_real_distribution<double> d(-0.99, 0.99);
+    constexpr int N = 1'000'000;
+    std::vector<std::array<double, 3>> xs(N);
+    for (auto &x : xs) x = {d(gen), d(gen), d(gen)};
 
     const auto t0 = std::chrono::steady_clock::now();
     double acc = 0.0;
@@ -32,10 +31,11 @@ int main() {
 
     double mx = 0.0;
     for (auto &x : xs) {
-        const double exact = bump(x)[0];
+        const double exact = gaussian(x)[0];
         if (std::abs(exact) > 1e-12)
             mx = std::max(mx, std::abs(fn(x)[0] - exact) / std::abs(exact));
     }
+
     std::cout << "MEvals/s: " << N / (dt * 1e6) << "\n";
     std::cout << "max relative error: " << mx << "\n";
     std::cout << "ignore: " << acc << "\n";

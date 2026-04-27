@@ -20,3 +20,4 @@ endfunction()
 
 _baobzi_add_cpp_test(test_template tests/test_template.cpp)
 _baobzi_add_cpp_test(test_cpp      tests/test_cpp.cpp)
+_baobzi_add_cpp_test(test_greens   tests/test_greens.cpp)

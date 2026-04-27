@@ -29,7 +29,7 @@ int main() {
 
     // Fit `runge` on [-1, 1] to 1e-10. Panel count falls out of the
     // adaptive tree; the leaf degree defaults to 8 (AVX-512 lane count).
-    auto fn = baobzi::fit(runge, /*tol=*/1e-10, -1.0, 1.0);
+    auto fn = baobzi::fit(runge, -1.0, 1.0, /*tol=*/1e-10);
 
     return fn(0.3) != 0.0;
 }
@@ -42,25 +42,19 @@ auto bump = [](std::array<double, 2> x) -> std::array<double, 1> {
     return {std::exp(-100.0 * (x[0] - 0.5) * (x[0] - 0.5)
                    - (x[1] - 0.5) * (x[1] - 0.5))};
 };
-auto fn = baobzi::fit(bump, 1e-8,
-                      std::array{0.0, 0.0}, std::array{1.0, 1.0});
+auto fn = baobzi::fit(bump,
+                      std::array{0.0, 0.0}, std::array{1.0, 1.0},
+                      /*tol=*/1e-8);
 ```
 
-Other factory overloads:
+Override the leaf degree via the template parameter:
 
 ```cpp
-// Override leaf degree (compile-time).
-auto fn = baobzi::fit<12>(f, 1e-10, a, b);
-
-// Runtime-selected leaf degree. Degree is dispatched via POET to a
-// compile-time specialisation; the return value is a RuntimeFunction
-// wrapping std::variant over all supported degrees.
-auto fn = baobzi::fit(f, /*n=*/12, /*tol=*/1e-10, a, b);
-
-// Fixed-tolerance compile-time-degree overload. Used by microbenchmarks
-// when a deterministic panel count is desirable.
-auto fn = baobzi::fit<8>(f, a, b);
+auto fn = baobzi::fit<12>(f, a, b, /*tol=*/1e-10);
 ```
+
+`tol` is positional (no default) so every call site spells out its target
+accuracy — there is no "magic tol" overload.
 
 `baobzi::options` exposes the fit-time knobs (`tol_kind`, `min_depth`,
 `max_depth`, `n_samples_per_dim`, `minimum_leaf_fraction`). `tol_kind` is a

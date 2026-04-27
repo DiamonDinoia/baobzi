@@ -7,7 +7,7 @@ include(FetchContent)
 FetchContent_Declare(
     polyfit
     GIT_REPOSITORY https://github.com/DiamonDinoia/polyfit.git
-    GIT_TAG        main
+    GIT_TAG        c70d92334742d476892b7ce4b4028868302cdfe8
     SYSTEM
 )
 set(POLYFIT_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -17,7 +17,7 @@ FetchContent_MakeAvailable(polyfit)
 FetchContent_Declare(
     poet
     GIT_REPOSITORY https://github.com/DiamonDinoia/POET.git
-    GIT_TAG        main
+    GIT_TAG        af0d3a482f4d35da8277f73ef63858037d636441
     SYSTEM
 )
 set(POET_BUILD_TESTS      OFF CACHE BOOL "" FORCE)

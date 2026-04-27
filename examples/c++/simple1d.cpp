@@ -8,7 +8,7 @@
 
 int main() {
     auto runge = [](double x) { return 1.0 / (1.0 + 25.0 * x * x); };
-    auto fn = baobzi::fit<8>(runge, -1.0, 1.0);
+    auto fn = baobzi::fit(runge, -1.0, 1.0, /*tol=*/1e-10);
 
     std::mt19937 gen(1);
     std::uniform_real_distribution<double> d(-0.99, 0.99);

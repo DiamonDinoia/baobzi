@@ -36,8 +36,23 @@ else()
 endif()
 
 # Performance-critical flags for ND polyfit codegen.
-add_compile_options(-funroll-loops -funsafe-math-optimizations)
-add_link_options(-funroll-loops -funsafe-math-optimizations)
+#
+# `-march=native` is critical: without it the compiler targets the x86-64
+# baseline ISA, which has no FMA — every Horner step then becomes a libm
+# fma() call instead of a single `vfmadd231sd` / `vfmadd231pd`. Profiling
+# the multi-leaf hot path showed ~50% of runtime in libm's __fma_fma3
+# before this was enabled.
+#
+# Override at configure time with `-DBAOBZI_ARCH=...` to target a portable
+# baseline (e.g. `x86-64-v3` for AVX2+FMA without per-machine tuning).
+set(BAOBZI_ARCH "native" CACHE STRING
+    "CPU target for -march/-mtune (e.g. native, x86-64-v3)")
+add_compile_options(-march=${BAOBZI_ARCH} -mtune=${BAOBZI_ARCH}
+                    -funroll-loops -funsafe-math-optimizations
+                    -ffp-contract=fast)
+add_link_options(-march=${BAOBZI_ARCH} -mtune=${BAOBZI_ARCH}
+                 -funroll-loops -funsafe-math-optimizations
+                 -ffp-contract=fast)
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
