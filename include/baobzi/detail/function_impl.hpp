@@ -69,13 +69,28 @@ struct TreeInput {
     int     n_samples_per_dim     = 8;
     /// Soft cap on accumulated leaf storage, in MiB. The fit aborts with
     /// `MemoryBudgetExceeded` once `polyfits.size() * sizeof(poly_eval_type)`
-    /// crosses this. Set to 0 to disable. Default 1 GiB matches the common
-    /// case where a runaway fit is more likely a programming mistake than a
-    /// genuine need; raise it explicitly for ambitious fits.
-    int     max_memory_mib        = 1024;
+    /// + node storage crosses this. Set to 0 to disable. Default 64 MiB —
+    /// sized to stay below typical LLCs so the evaluator coexists with the
+    /// caller's working set; ambitious 3D fits should raise it deliberately.
+    int     max_memory_mib        = 64;
+    /// When true, panels that fail tolerance at `max_depth` are accepted as
+    /// best-effort leaves instead of throwing `MaxDepthExceeded`. The
+    /// resulting `Function` exposes the unconverged panel list via
+    /// `non_converged_panels()`. Default false (throw).
+    bool    allow_max_depth_leaves = false;
     TolKind tol_kind              = TolKind::RelativeMax;
 };
 } // namespace detail
+
+/// A panel where adaptive paneling failed to meet `tol` at the configured
+/// `max_depth`. Reported either through `MaxDepthExceeded::panels()` (the
+/// default throwing path) or through `Function::non_converged_panels()`
+/// when `options.allow_max_depth_leaves == true`.
+struct NonConvergedPanel {
+    std::vector<double> a;     ///< Lower bound of the half-open panel.
+    std::vector<double> b;     ///< Upper bound of the half-open panel.
+    std::size_t         depth; ///< Tree depth at which convergence failed.
+};
 
 /// Thrown when adaptive paneling hits `options.max_depth` without converging.
 /// Carries the offending panel as a half-open domain [a, b) and the depth,
@@ -103,17 +118,42 @@ class MaxDepthExceeded : public std::exception {
         msg_ = os.str();
     }
 
+    /// Construct from a list of unconverged panels (the aggregate path).
+    /// `panels` must be non-empty; the first entry's bounds are mirrored into
+    /// the legacy single-panel accessors `a()/b()` for backwards compatibility.
+    explicit MaxDepthExceeded(std::vector<NonConvergedPanel> panels)
+        : panels_(std::move(panels)) {
+        if (!panels_.empty()) {
+            depth_ = panels_.front().depth;
+            a_     = panels_.front().a;
+            b_     = panels_.front().b;
+        }
+        std::ostringstream os;
+        os << "Baobzi fit error: tree depth exceeded max allowed input depth ("
+           << depth_ << ") on " << panels_.size() << " panel"
+           << (panels_.size() == 1 ? "" : "s") << "; first ";
+        format_domain(os);
+        os << " — likely a singularity; subdivide manually, raise "
+              "options.max_depth, or set options.allow_max_depth_leaves=true "
+              "to accept best-effort leaves.";
+        msg_ = os.str();
+    }
+
     std::size_t                depth() const noexcept { return depth_; }
-    /// Lower bound(s) of the offending half-open panel [a, b).
+    /// Lower bound(s) of the first unconverged panel [a, b). Legacy accessor;
+    /// for the full list use `panels()`.
     const std::vector<double> &a()     const noexcept { return a_; }
-    /// Upper bound(s) of the offending half-open panel [a, b).
+    /// Upper bound(s) of the first unconverged panel [a, b).
     const std::vector<double> &b()     const noexcept { return b_; }
+    /// Full list of unconverged panels gathered before the throw.
+    const std::vector<NonConvergedPanel> &panels() const noexcept { return panels_; }
     const char                *what()  const noexcept override { return msg_.c_str(); }
 
   private:
     std::size_t         depth_ = 0;
     std::vector<double> a_;
     std::vector<double> b_;
+    std::vector<NonConvergedPanel> panels_;
     std::string         msg_ =
         "Baobzi fit error: tree depth exceeded max allowed input depth";
 
@@ -531,20 +571,30 @@ class Node {
     static constexpr std::size_t input_dim = get_tuple_size<input_type>();
     static constexpr std::size_t output_dim = get_tuple_size<output_type>();
 
-    Value<value_type, input_dim> center;
-    std::uint64_t poly_eval_id = std::numeric_limits<std::uint64_t>::max();
-    std::uint32_t first_child_idx = std::numeric_limits<std::uint32_t>::max();
+    static constexpr std::uint32_t kLeafSentinel = std::numeric_limits<std::uint32_t>::max();
 
-    Node(const Box<value_type, input_dim> &box) : center{box.center} {}
+    // Slim 8-B node (Phase 9 / Layer A): no `center`, no `_pad_`, and
+    // `poly_eval_id` shrunk to uint32. `center` is recomputed on the fly
+    // during descent from the subtree's (lo, hi) carried in registers, and
+    // the caller-side leaf-id table already reads `poly_eval_id` as uint32.
+    // 8 nodes/cache line for every Dim — descent walks ~5× fewer lines vs
+    // the old 40-B 3D node. `first_child_idx == kLeafSentinel` is the leaf
+    // sentinel; `poly_eval_id` is meaningful only when leaf.
+    std::uint32_t first_child_idx = kLeafSentinel;
+    std::uint32_t poly_eval_id    = kLeafSentinel;
 
-    inline bool is_leaf() const {
-        return poly_eval_id != std::numeric_limits<std::uint64_t>::max();
-    }
+    Node() = default;
+
+    inline bool is_leaf() const { return first_child_idx == kLeafSentinel; }
 
     /// Fit this node to the requested tolerance. On success, stores the
-    /// poly_eval_id into polyfits and returns true.
-    bool fit(const detail::TreeInput &input, const Func &func, const Value<value_type, input_dim> &half_length,
-             const std::vector<value_type> &samples, std::vector<poly_eval_type> &polyfits) {
+    /// poly_eval_id into polyfits and returns true. Center/half_length are
+    /// passed in (the runtime Node no longer carries `center`).
+    bool fit(const detail::TreeInput &input, const Func &func,
+             const Value<value_type, input_dim> &center,
+             const Value<value_type, input_dim> &half_length,
+             const std::vector<value_type> &samples,
+             std::vector<poly_eval_type> &polyfits) {
         if (!samples.empty())
             throw std::runtime_error("Baobzi fit error: sample points not yet supported");
 
@@ -569,12 +619,42 @@ class Node {
                 return rollback_and_fail();
         }
 
-        poly_eval_id = n_polyfit_before;
+        poly_eval_id = static_cast<std::uint32_t>(n_polyfit_before);
         return true;
+    }
+
+    /// Accept the polynomial as a leaf even though the tolerance check
+    /// failed. Used at `max_depth` when `allow_max_depth_leaves` is set.
+    void force_fit_as_leaf(const Func &func,
+                           const Value<value_type, input_dim> &center,
+                           const Value<value_type, input_dim> &half_length,
+                           std::vector<poly_eval_type> &polyfits) {
+        const input_type lb = center - half_length;
+        const input_type ub = center + half_length;
+        polyfits.emplace_back(func, lb, ub);
+        poly_eval_id = static_cast<std::uint32_t>(polyfits.size() - 1);
     }
 
     inline std::size_t memory_usage() const { return sizeof(*this); }
 };
+
+// Phase 9 / Layer A: lock the slim 8-B node invariant. If this fires,
+// either an extra field was added or alignment regressed — the descent
+// load-volume win in `get_node_index` depends on 8 nodes/cache line.
+namespace detail_node_size_check {
+struct ScalarFn {
+    double operator()(double) const { return 0.0; }
+};
+struct Array2Fn {
+    std::array<double, 1> operator()(std::array<double, 2>) const { return {0.0}; }
+};
+struct Array3Fn {
+    std::array<double, 1> operator()(std::array<double, 3>) const { return {0.0}; }
+};
+static_assert(sizeof(Node<ScalarFn, 8>) == 8, "slim Node expected to be 8 B (1D)");
+static_assert(sizeof(Node<Array2Fn, 8>) == 8, "slim Node expected to be 8 B (2D)");
+static_assert(sizeof(Node<Array3Fn, 8>) == 8, "slim Node expected to be 8 B (3D)");
+} // namespace detail_node_size_check
 
 /// Represent a function over some domain as a tree of Chebyshev nodes.
 template <std::size_t Degree, class Func>
@@ -595,7 +675,9 @@ struct PolyTree {
     using dim_array_t = Value<value_type, input_dim>;
 
     inline PolyTree(const detail::TreeInput &input, const Box<value_type, input_dim> &root_box,
-                    std::vector<poly_eval_type> &polyfits, const Func &func) {
+                    std::vector<poly_eval_type> &polyfits, const Func &func)
+        : lower_(root_box.center - root_box.half_length),
+          upper_(root_box.center + root_box.half_length) {
         std::queue<box_t> q;
         dim_array_t half_width = root_box.half_length * value_type{0.5};
         q.push(root_box);
@@ -605,23 +687,42 @@ struct PolyTree {
         while (!q.empty()) {
             const std::size_t n_next = q.size();
             const std::size_t node_index = nodes_.size();
+            // True when this is the last allowed level: any node that fails
+            // its tolerance check here cannot be subdivided further.
+            const bool at_max_depth =
+                max_depth_ == static_cast<std::size_t>(input.max_depth);
             for (std::size_t i = 0; i < n_next; ++i) {
                 box_t current_box = q.front();
                 q.pop();
 
-                nodes_.emplace_back(current_box);
+                nodes_.emplace_back();
 
                 auto &node = nodes_[i + node_index];
-                const bool successful_fit = node.fit(input, func, current_box.half_length, {}, polyfits);
+                const bool successful_fit = node.fit(input, func, current_box.center,
+                                                     current_box.half_length, {}, polyfits);
 
                 if (successful_fit) {
                     assert(polyfits.size() > 0);
                     assert(node.poly_eval_id == polyfits.size() - 1);
+                } else if (at_max_depth) {
+                    // Record the failed panel and force-accept the polynomial
+                    // as a best-effort leaf. The decision to throw or accept
+                    // is made at the Function level after all subtrees finish,
+                    // so a multi-subtree fit can report panels from every
+                    // failing subtree rather than just the first one to throw.
+                    const auto a_arr = (current_box.center - current_box.half_length).as_array();
+                    const auto b_arr = (current_box.center + current_box.half_length).as_array();
+                    non_converged_panels_.push_back(NonConvergedPanel{
+                        std::vector<double>(a_arr.begin(), a_arr.end()),
+                        std::vector<double>(b_arr.begin(), b_arr.end()),
+                        max_depth_});
+                    node.force_fit_as_leaf(func, current_box.center,
+                                           current_box.half_length, polyfits);
                 } else {
                     node.first_child_idx = static_cast<std::uint32_t>(curr_child_idx);
                     curr_child_idx += n_child;
 
-                    const dim_array_t &node_center = node.center;
+                    const dim_array_t &node_center = current_box.center;
                     for (index_t child = 0; child < n_child; ++child) {
                         dim_array_t center_offset;
 
@@ -636,16 +737,13 @@ struct PolyTree {
                 }
             }
 
+            // At max_depth, all failing panels were force-accepted as leaves;
+            // q stays empty for those, so the BFS terminates cleanly. The
+            // throw/accept decision happens at the Function level once all
+            // subtrees have finished, in `gather_non_converged_panels()`.
+
             if (!q.empty())
                 ++max_depth_;
-            if (max_depth_ > static_cast<std::size_t>(input.max_depth)) {
-                // q.front() is the first unfitted box at the depth that blew
-                // up — identifies the smallest interval we tried (and failed)
-                // to fit, which is where the singularity lives.
-                const auto &offender = q.front();
-                throw MaxDepthExceeded(max_depth_, offender.center.as_array(),
-                                       offender.half_length.as_array());
-            }
             if (input.max_memory_mib > 0 && !q.empty()) {
                 const std::size_t budget =
                     static_cast<std::size_t>(input.max_memory_mib) * std::size_t{1024} * std::size_t{1024};
@@ -665,25 +763,41 @@ struct PolyTree {
 
     inline const node_t &find_node(const input_type &x) const { return nodes_[get_node_index(x)]; }
 
+    /// Descent hot loop. Phase 9 / Layers A+E: the node no longer carries
+    /// `center`; instead the per-subtree (lo, hi) bounds are carried in
+    /// registers and `mid = 0.5 * (lo + hi)` is recomputed each level.
+    /// This drops Dim×8 B of per-level center loads — the descent is no
+    /// longer load-bound on the center field. For ND, the per-axis
+    /// `x[i] > mid[i]` lowers to a packed `vcmpgtpd + vmovmskpd` with the
+    /// loop unrolled (input_dim is constexpr), collapsing the serial
+    /// scalar-compare chain.
+    ///
+    /// Bit-exactness vs the pre-Phase-9 evaluator is not guaranteed at
+    /// boundary points: this `mid` is computed differently from the
+    /// fit-time `box.center` (which is built by chained halving). They
+    /// agree algebraically; tests assert relative tolerance, not bit
+    /// equality.
     inline std::size_t get_node_index(const input_type &x) const {
+        dim_array_t lo = lower_;
+        dim_array_t hi = upper_;
         index_t curr_index = 0;
         while (!nodes_[curr_index].is_leaf()) {
             index_t child_idx = 0;
-
-            if constexpr (has_tuple_size_v<input_type>)
-                for (std::size_t i = 0; i < input_dim; ++i)
-                    child_idx = child_idx |
-                                (static_cast<index_t>(x[i] > nodes_[curr_index].center[i]) << i);
-            else
-                child_idx = static_cast<index_t>(x > nodes_[curr_index].center[0]);
-
-            const index_t next = nodes_[curr_index].first_child_idx + child_idx;
-#if defined(__GNUC__) || defined(__clang__)
-            __builtin_prefetch(&nodes_[next]);
-#endif
-            curr_index = next;
+            if constexpr (has_tuple_size_v<input_type>) {
+                for (std::size_t i = 0; i < input_dim; ++i) {
+                    const value_type mid_i = (lo[i] + hi[i]) * value_type{0.5};
+                    const bool upper = (x[i] > mid_i);
+                    child_idx |= (static_cast<index_t>(upper) << i);
+                    (upper ? lo[i] : hi[i]) = mid_i;
+                }
+            } else {
+                const value_type mid = (lo[0] + hi[0]) * value_type{0.5};
+                const bool upper = (x > mid);
+                child_idx = static_cast<index_t>(upper);
+                (upper ? lo[0] : hi[0]) = mid;
+            }
+            curr_index = nodes_[curr_index].first_child_idx + child_idx;
         }
-
         return curr_index;
     }
 
@@ -700,9 +814,18 @@ struct PolyTree {
     inline auto &get_nodes() { return nodes_; }
     inline auto &get_nodes() const { return nodes_; }
 
+    inline const std::vector<NonConvergedPanel> &non_converged_panels() const {
+        return non_converged_panels_;
+    }
+
   private:
     std::vector<node_t> nodes_;
+    // Subtree bounding box, set in the constructor. Carried into descent so
+    // the runtime Node doesn't need a `center` field (Phase 9 / Layer A).
+    dim_array_t lower_{};
+    dim_array_t upper_{};
     std::size_t max_depth_ = 0;
+    std::vector<NonConvergedPanel> non_converged_panels_;
 };
 } // namespace detail
 
@@ -730,7 +853,7 @@ class Function {
     inline std::size_t memory_usage() const {
         std::size_t mem = sizeof(*this);
         mem += subtree_node_offsets_.capacity() * sizeof(typename decltype(subtree_node_offsets_)::value_type);
-        mem += node_pointers_.capacity() * sizeof(node_t *);
+        mem += leaf_index_by_global_node_.capacity() * sizeof(std::uint32_t);
         mem += polyfits_.capacity() * sizeof(poly_eval_type);
         for (const auto &subtree : subtrees_)
             mem += subtree.memory_usage();
@@ -812,18 +935,18 @@ class Function {
                 box_t current_box = q.front();
                 q.pop();
 
-                nodes.emplace_back(node_t(current_box));
+                nodes.emplace_back();
                 auto &node = nodes.back();
                 std::vector<poly_eval_type> dummy;
-                node.fit(input, func, current_box.half_length, {}, dummy);
+                node.fit(input, func, current_box.center, current_box.half_length, {}, dummy);
                 if (node.poly_eval_id != 0u)
                     node.poly_eval_id = 0;
 
                 if (!node.is_leaf() || stats_.base_depth < static_cast<std::size_t>(input.min_depth)) {
-                    add_node_children_to_queue(q, node.center, half_width);
+                    add_node_children_to_queue(q, current_box.center, half_width);
                 } else {
                     leaf_fraction += value_type{1.0};
-                    add_node_children_to_queue(maybe_q, node.center, half_width);
+                    add_node_children_to_queue(maybe_q, current_box.center, half_width);
                 }
             }
             stats_.n_evals_root += static_cast<std::uint64_t>(
@@ -880,6 +1003,28 @@ class Function {
             subtrees_.emplace_back(input_local, subtree_root, polyfits_, func);
         }
 
+        // Aggregate any per-subtree non-converged panels. Default behaviour
+        // prints them to cerr and throws; opt-in keeps the list on the
+        // Function for `non_converged_panels()` introspection.
+        for (const auto &subtree : subtrees_)
+            for (const auto &p : subtree.non_converged_panels())
+                non_converged_panels_.push_back(p);
+
+        if (!non_converged_panels_.empty()) {
+            if (!input.allow_max_depth_leaves) {
+                std::cerr << "Baobzi fit warning: " << non_converged_panels_.size()
+                          << " panel" << (non_converged_panels_.size() == 1 ? "" : "s")
+                          << " failed to converge at max_depth=" << input.max_depth << ":\n";
+                for (const auto &p : non_converged_panels_) {
+                    std::cerr << "  [";
+                    for (std::size_t k = 0; k < p.a.size(); ++k)
+                        std::cerr << (k ? " x " : "") << "[" << p.a[k] << ", " << p.b[k] << ")";
+                    std::cerr << "]\n";
+                }
+                throw MaxDepthExceeded(non_converged_panels_);
+            }
+        }
+
         const auto t_end = std::chrono::steady_clock::now();
         stats_.t_elapsed = static_cast<std::uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count());
@@ -896,12 +1041,16 @@ class Function {
             subtrees_.begin(), subtrees_.end(), std::size_t{0},
             [](std::size_t prior, const auto &subtree) { return prior + subtree.size(); });
 
-        node_pointers_.resize(n_nodes_tot);
-
+        // Flat global-node-index → poly_eval_id table. The eval hot path
+        // (perf-confirmed) is currently bottlenecked on the two-load
+        // pointer-chase `node_pointers_[idx]->poly_eval_id`; this table
+        // collapses it to a single uint32 load.
+        leaf_index_by_global_node_.resize(n_nodes_tot);
         std::size_t i = 0;
         for (auto &subtree : subtrees_)
             for (auto &node : subtree.get_nodes())
-                node_pointers_[i++] = &node;
+                leaf_index_by_global_node_[i++] =
+                    static_cast<std::uint32_t>(node.poly_eval_id);
     }
 
     /// Convert linear bin index to [dim] bin vector.
@@ -972,6 +1121,12 @@ class Function {
     /// Fast path groups points by owning leaf via counting sort, then invokes
     /// polyfit's SIMD batch kernel once per leaf. Scalar per-point traversal
     /// is kept for tiny batches where the sort cannot amortize.
+    ///
+    /// Thread-safe: a single Function may be called concurrently from
+    /// multiple threads provided each call's `xp` and `res` slices do not
+    /// overlap with another thread's. Per-call scratch is `thread_local`;
+    /// the Function's internal state (nodes, polyfits) is immutable after
+    /// construction. Pinned by `tests/test_threadsafe.cpp`.
     inline void operator()(const value_type *xp, value_type *res, std::size_t n_trg) const {
         if (n_trg == 0) return;
         if (n_trg == 1) {
@@ -1021,8 +1176,7 @@ class Function {
                     in_domain = false;
             });
             const std::uint32_t id = in_domain
-                ? static_cast<std::uint32_t>(
-                      node_pointers_[get_global_node_index(xi)]->poly_eval_id)
+                ? leaf_index_by_global_node_[get_global_node_index(xi)]
                 : ood_id;
             leaf_ids[i] = id;
             ++counts[id];
@@ -1122,6 +1276,7 @@ class Function {
     }
 
     /// Legacy int overload — forwarded to the std::size_t version above.
+    /// Same thread-safety contract as the std::size_t overload.
     inline void operator()(const value_type *xp, value_type *res, int n_trg) const {
         (*this)(xp, res, static_cast<std::size_t>(n_trg));
     }
@@ -1140,6 +1295,13 @@ class Function {
         return polyfits_[find_node(x).poly_eval_id](x);
     }
 
+    /// Panels where adaptive paneling failed at `max_depth`. Always empty
+    /// unless `options.allow_max_depth_leaves == true` was set; the default
+    /// path throws `MaxDepthExceeded` (which carries the same list) instead.
+    inline const std::vector<NonConvergedPanel> &non_converged_panels() const {
+        return non_converged_panels_;
+    }
+
     inline std::pair<dim_array_t, dim_array_t> get_bounds() const {
         return std::make_pair(lower_left_, upper_right_);
     }
@@ -1154,10 +1316,12 @@ class Function {
     std::vector<detail::PolyTree<Degree, Func>> subtrees_;
     detail::Value<std::size_t, input_dim> n_subtrees_{};
     std::vector<std::size_t> subtree_node_offsets_;
-    std::vector<node_t *> node_pointers_;
+    std::vector<std::uint32_t> leaf_index_by_global_node_;
     dim_array_t inv_bin_size_{};
 
     std::vector<poly_eval_type> polyfits_;
+
+    std::vector<NonConvergedPanel> non_converged_panels_;
 
     /// Structure containing info about self creation.
     struct {

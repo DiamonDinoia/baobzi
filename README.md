@@ -91,6 +91,16 @@ target_include_directories(your_target PRIVATE extern/baobzi/include)
 Baobzi itself is header-only; polyfit and POET provide the leaf evaluators
 and compile-time dispatch.
 
+## Thread safety
+
+Once `baobzi::fit(...)` returns, the resulting `Function` is immutable and
+its `operator()` is safe to call concurrently from multiple threads. Each
+call must write to a disjoint slice of `res[]`; per-call scratch is held in
+`thread_local` storage and the eval path never mutates shared state. Baobzi
+does not parallelize internally — chunk your inputs and spawn threads
+yourself; this contract makes that pattern safe. Pinned by
+`tests/test_threadsafe.cpp`.
+
 ## Limitations
 
 * Baobzi can use a _lot_ of memory on oscillatory or rapidly-varying

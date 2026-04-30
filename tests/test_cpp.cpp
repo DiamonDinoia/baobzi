@@ -320,6 +320,40 @@ TEST_CASE("Memory budget aborts a runaway near-singular fit",
         baobzi::MaxDepthExceeded);
 }
 
+TEST_CASE("allow_max_depth_leaves accepts unconverged panels",
+          "[baobzi][maxdepth][lossy]") {
+    auto f = [](double x) { return std::sqrt(std::abs(x - 0.5)); };
+
+    // Default path (allow_max_depth_leaves=false) must throw and the
+    // exception must carry every unconverged panel, not just the first.
+    try {
+        (void)fit<8>(f, 0.0, 1.0, /*tol=*/1e-10,
+                     options{.tol_kind = baobzi::TolKind::AbsoluteMax,
+                             .max_depth = 4});
+        FAIL("expected MaxDepthExceeded");
+    } catch (const baobzi::MaxDepthExceeded &e) {
+        REQUIRE_FALSE(e.panels().empty());
+        for (const auto &p : e.panels()) {
+            REQUIRE(p.a.size() == 1);
+            REQUIRE(p.b.size() == 1);
+            REQUIRE(p.a[0] < p.b[0]);
+            REQUIRE(p.depth == 4);
+        }
+        REQUIRE(e.a() == e.panels().front().a);
+        REQUIRE(e.b() == e.panels().front().b);
+    }
+
+    // Opt-in path: same fit completes, and the unconverged panels are
+    // surfaced via Function::non_converged_panels(). Eval still produces
+    // a finite (best-effort) value at the singular point.
+    auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10,
+                     options{.tol_kind = baobzi::TolKind::AbsoluteMax,
+                             .max_depth = 4,
+                             .allow_max_depth_leaves = true});
+    REQUIRE_FALSE(fn.non_converged_panels().empty());
+    REQUIRE(std::isfinite(fn(0.5)));
+}
+
 TEST_CASE("Batch handles out-of-domain points as NaN", "[baobzi][batch][ood]") {
     auto f = [](double x) { return std::sin(x); };
     auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10);

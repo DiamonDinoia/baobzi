@@ -5,6 +5,14 @@
 /// \brief Public C++ API for the baobzi piecewise-Chebyshev function
 ///        approximator. Built on polyfit's leaf evaluators; baobzi adds the
 ///        adaptive tree (paneling) layer on top.
+///
+/// Thread safety. Once `baobzi::fit(...)` returns, the resulting Function is
+/// immutable and its `operator()` is safe to call concurrently from multiple
+/// threads, provided each call writes to a disjoint output slice. Per-call
+/// scratch is held in `thread_local` storage; nothing on the eval path
+/// mutates shared state. Baobzi does not parallelize internally — callers
+/// chunk their inputs and spawn threads themselves; this contract makes that
+/// pattern safe. See `tests/test_threadsafe.cpp`.
 
 #include <array>
 #include <concepts>
@@ -38,10 +46,19 @@ struct options {
     int     max_depth             = 50;
     int     n_samples_per_dim     = 8;
     /// Soft cap on accumulated leaf storage during the fit, in MiB.
-    /// `MemoryBudgetExceeded` is thrown if the budget is exceeded; set to
-    /// `0` to disable the check. Default 1 GiB is generous for typical
-    /// smooth fits and catches runaway near-singular ones quickly.
-    int     max_memory_mib        = 1024;
+    /// `MemoryBudgetExceeded` is thrown if the budget is exceeded; set
+    /// to `0` to disable the check. Default 64 MiB sits below typical
+    /// LLCs (Sapphire Rapids ~60 MB, Zen4 ~96 MB shared, M1-class
+    /// ~24–48 MB) so the resulting evaluator stays cache-resident
+    /// alongside the caller's working set. Raise it for ambitious 3D+
+    /// fits — `MemoryBudgetExceeded` carries the offending panel so the
+    /// caller can locate the singular region or bump the cap deliberately.
+    int     max_memory_mib        = 64;
+    /// When true, panels that hit `max_depth` without converging are kept as
+    /// best-effort leaves (no exception). Inspect them via
+    /// `Function::non_converged_panels()`. Default false (throw with the
+    /// panel list attached on the exception).
+    bool    allow_max_depth_leaves = false;
 };
 
 /// Any callable that accepts `Domain` and returns a value.
@@ -67,6 +84,7 @@ inline TreeInput make_input(int input_dim, int output_dim, int degree,
     in.tol_kind              = opts.tol_kind;
     in.n_samples_per_dim     = opts.n_samples_per_dim;
     in.max_memory_mib        = opts.max_memory_mib;
+    in.allow_max_depth_leaves = opts.allow_max_depth_leaves;
     return in;
 }
 

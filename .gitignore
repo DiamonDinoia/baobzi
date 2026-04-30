@@ -7,3 +7,4 @@ __pycache__
 *.mexa64
 src/python/baobzi/libbaobzi.so
 .claude/
+/report*
