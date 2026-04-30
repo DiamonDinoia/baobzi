@@ -902,3 +902,166 @@ volume, has become the new gate.
   refactor (use `current_box.center` where the old code touched
   `node.center`).
 
+
+## Iteration 10 — post-Phase-9 hot-loop chase (Phase 10 Tier 1)
+
+### Setup
+
+Same hardware/protocol as iter 9 (Core Ultra 7 155H, P-core, `taskset
+-c 2`, 3×15 s `baobzi_perf_driver`, median reported). Re-baseline at
+the start of the phase showed iter-9 numbers had drifted slightly under
+ambient load — **2D 9.65, 3D 7.94 Mevals/s** is the local baseline used
+for Δ comparisons below.
+
+Per-layer protocol: implement → ctest 33/33 → 3×15 s perf median →
+ship if Δ ≥ +1 % on either scenario AND no regression > 1 % on the
+other; discard otherwise.
+
+### What landed (two commits on `use-polyfit`)
+
+#### Layer 1.2 — drop the global-node → leaf-id table (`a5e8750`)
+
+Phase 9's slim 8-B Node co-locates `first_child_idx` and
+`poly_eval_id` on the same cacheline that the descent's `is_leaf()`
+check already touches. The flat
+`leaf_index_by_global_node_[]` table that Phase 7 introduced (when
+nodes were 40 B and the `node_pointers_[idx]->poly_eval_id` two-load
+pointer chase was a real cost) is now pure overhead — one extra
+`uint32` load per point in the histogram pass.
+
+Read `poly_eval_id` directly from the descent's leaf:
+```cpp
+const std::uint32_t id = subtrees_[get_linear_bin(xi)].find_node(xi).poly_eval_id;
+```
+Drops the table, the per-tree-offset prefix sum (`build_cache` is now
+empty), and the `get_global_node_index` helper (no external callers;
+`grep` confirmed). Memory: −4 B per global node + the prefix-sum array.
+
+| Scenario | Pre-1.2 | Post-1.2 | Δ |
+|---|---|---|---|
+| 2D bump deg=8 N=1e6 | 9.65 | **9.96** | **+3.2 %** |
+| 3D gauss deg=8 N=1e6 | 7.94 | **8.45** | **+6.4 %** |
+
+#### Layer 1.4 — drop `std::copy` in `Value(const T*)` ctor (`4d97121`)
+
+The histogram inner loop instantiates one `Value<value_type,
+input_dim>` per point via `Value(const T*)`. For `input_dim ∈ {2, 3}`
+GCC 15.2 declined to inline the `std::copy` call, emitting a per-call
+sequence
+```
+call _ZSt4copyIPdS0_ET0_T_S2_S1_.isra.0
+```
+inside a 1 M-iteration hot loop. That's the cost of moving 16 / 24
+bytes behind a function call, register save/restore, and a return —
+5–10 × the work of the load itself.
+
+Replace with `poet::static_for<N>(...)` so the dim-element copy
+unrolls inline at compile time. `objdump --disassemble=main` on the
+perf driver confirms the `std::copy<.isra.0>` call is gone from the
+histogram body; only the fit-time constructors retain `isra` calls
+(unrelated).
+
+| Scenario | Pre-1.4 | Post-1.4 | Δ |
+|---|---|---|---|
+| 2D bump deg=8 N=1e6 | 9.96 | **18.30** | **+83.7 %** |
+| 3D gauss deg=8 N=1e6 | 8.45 | **18.22** | **+115.6 %** |
+
+This was the single biggest win of the phase. The `std::copy` isra
+call was eating ≈ 30 ns of the ≈ 110 ns/eval budget — pure call
+overhead. A 5-line change.
+
+### Discard log
+
+The plan's other Tier-1 layers were tried; none shipped.
+
+#### 1.1 — switch polyfit `FusionMode::Never` → `FusionMode::Always`
+
+ctest hung indefinitely on the 3D batch test (`Batch vs single
+evaluation agree — 3D scalar output`) and the 3D Yukawa
+`MemoryBudgetExceeded` test. Hypothesis: `fuseNDDomain`'s unconditional
+fusion at `FusionMode::Always` produces ill-conditioned coefficients on
+non-canonical 3D domains (the `else`-branch heuristic that Always
+bypasses includes a condition-number guard
+`(coeffCount-1) * log10(|α|+|β|+1) < digits10 - 3`). The result was
+either NaN-tainted evals that drove `sample_error_check` into infinite
+refinement, or a runaway recursion that the memory budget eventually
+caught — but slowly enough to look like a hang. **Reverted; deferred
+to a future polyfit-side fix.**
+
+#### 1.5 — `xsimd::default_allocator` on `xp_packed`/`out_packed`
+
+Initial measurement when 1.4 + 1.5 were stacked looked like a +5 %
+follow-up on top of 1.4. Splitting them out (1.4 alone, then 1.5 on
+top): 2D 18.30 → 17.03 (-6.9 %), 3D 18.22 → 16.69 (-8.4 %). The
+compiler inlines `std::allocator<double>` aggressively for
+`std::vector<double>::resize`; the xsimd allocator's templated
+equality/copy semantics defeat that and add per-call cost in the
+histogram resize path. The polyfit kernel's internal
+`alignas(kAlign)` AoS→SoA scratch buffer already gives it aligned
+loads regardless of the input vector's alignment. **Reverted.**
+
+#### 1.3 — force Layer E via xsimd `batch` in `get_node_index`
+
+Vectorised the descent's per-axis compare to a single `vcmplt_oqpd +
+vmovmskpd` (objdump confirmed). 2D 18.30 → 14.92 (-18.5 %), 3D 18.22
+→ 17.55 (-3.7 %). simdref `llm batch` analysis on the resulting
+descent body explained the regression:
+
+| Insn (per descent iter) | Lat | CPI | Crit path |
+|---|---|---|---|
+| `vaddpd` (lo+hi) | 2 | 0.50 | FP |
+| `vmulpd` (×0.5) | 3 | 0.50 | FP |
+| `vcmplt_oqpd` | 1 | 0.50 | FP |
+| `vmovmskpd` | 2 | 0.50 | INT |
+| `vpcmpgtq` | 1 | 0.25 | redundant |
+| `and / add / lea` | 1 each | 0.25 | INT |
+| `vblendvpd` × 2 | 1 | 0.50 | FP |
+| `mov (rax), eax` | ~5 | 0.50 | INT |
+
+FP recurrence per iter: 2+3+1+1 = **7 c**.
+INT recurrence (carrying `curr_index` through the load chain):
+`vmovmskpd(2) + and(1) + add(1) + lea(1) + load(~5)` = **10 c**.
+
+The integer chain gates descent throughput. Compressing the FP path
+(P1 in the analysis: track `lo_v` + halving `delta_v` instead of
+`(lo_v, hi_v)` to drop critical FP from 7 c to 4 c per iter) doesn't
+help because FP was already off-critical. The pre-descent setup —
+forced because `PolyTree::lower_/upper_` are 16 B (2D) / 24 B (3D)
+unaligned, so GCC loads via `xmm` + spills to a 32 B stack slot
+pre-zeroed via `vpxor` + reloads as `ymm`, ≈ 12 insns per point — is
+where the 2D regression came from. **Reverted.**
+
+The natural follow-up to make 1.3 land is a *layout* change in
+`PolyTree` rather than a *codegen* change in the descent: pad
+`lower_`/`upper_` to `alignas(32) std::array<double, 4>` so the
+ymm load is one `vmovapd`. That's a Tier-2 candidate (Layer 2.5
+in this notation), gated on its own A/B.
+
+### Cumulative numbers
+
+| Scenario | Phase 7 | Phase 9 (A+E) | Phase 10 (1.2 + 1.4) | Cumul. since Phase 7 |
+|---|---|---|---|---|
+| 2D bump deg=8 N=1e6 | 6.60 | 10.00 | **18.30** | **+177 %** |
+| 3D gauss deg=8 N=1e6 | 3.86 | 8.06 | **18.22** | **+372 %** |
+
+Both scenarios crossed the symbolic 18 Mevals/s line on a single
+P-core thread without an algorithmic change to the tree, the polyfit
+kernel, or the thread-safety contract.
+
+### Stop criterion (carry-over)
+
+Plan called for stopping after two consecutive layers ship with
+Δ ≤ +1 %. We ended on Tier 1 with two big shipments (+3.2 % / +6.4 %
+and then +83.7 % / +115.6 %), then three discards in a row. The
+discards are *not* the stop signal — they're three different
+attempts with different mechanics, and one of them (1.3) has a
+clean follow-up (Layer 2.5: `PolyTree` bound padding) that the
+asm-analysis identified as the real lever.
+
+Resuming after this entry would start with Layer 2.5, then 3.2
+(per-call leaf-id memo), per the original plan.
+
+### Files
+
+- `include/baobzi/detail/function_impl.hpp` — Layers 1.2, 1.4
+- `bench/results.md` — this entry

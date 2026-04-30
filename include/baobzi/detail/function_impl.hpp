@@ -247,7 +247,10 @@ class Value {
         if constexpr (N == 1) {
             data_ = arr[0];
         } else {
-            std::copy(arr, arr + N, data_.begin());
+            poet::static_for<N>([&](auto I) {
+                constexpr std::size_t i = I;
+                data_[i] = arr[i];
+            });
         }
     }
 
@@ -852,8 +855,6 @@ class Function {
 
     inline std::size_t memory_usage() const {
         std::size_t mem = sizeof(*this);
-        mem += subtree_node_offsets_.capacity() * sizeof(typename decltype(subtree_node_offsets_)::value_type);
-        mem += leaf_index_by_global_node_.capacity() * sizeof(std::uint32_t);
         mem += polyfits_.capacity() * sizeof(poly_eval_type);
         for (const auto &subtree : subtrees_)
             mem += subtree.memory_usage();
@@ -1031,27 +1032,7 @@ class Function {
         build_cache();
     }
 
-    inline void build_cache() {
-        subtree_node_offsets_.resize(n_subtrees_.prod());
-        subtree_node_offsets_[0] = 0;
-        for (std::size_t i = 1; i < subtree_node_offsets_.size(); ++i)
-            subtree_node_offsets_[i] = subtree_node_offsets_[i - 1] + subtrees_[i - 1].size();
-
-        const auto n_nodes_tot = std::accumulate(
-            subtrees_.begin(), subtrees_.end(), std::size_t{0},
-            [](std::size_t prior, const auto &subtree) { return prior + subtree.size(); });
-
-        // Flat global-node-index → poly_eval_id table. The eval hot path
-        // (perf-confirmed) is currently bottlenecked on the two-load
-        // pointer-chase `node_pointers_[idx]->poly_eval_id`; this table
-        // collapses it to a single uint32 load.
-        leaf_index_by_global_node_.resize(n_nodes_tot);
-        std::size_t i = 0;
-        for (auto &subtree : subtrees_)
-            for (auto &node : subtree.get_nodes())
-                leaf_index_by_global_node_[i++] =
-                    static_cast<std::uint32_t>(node.poly_eval_id);
-    }
+    inline void build_cache() {}
 
     /// Convert linear bin index to [dim] bin vector.
     inline std::array<std::size_t, input_dim> get_bins(const std::size_t i_bin) const {
@@ -1110,11 +1091,6 @@ class Function {
     }
 
     inline const node_t &find_node(const input_type &x) const { return subtrees_[get_linear_bin(x)].find_node(x); }
-
-    inline std::size_t get_global_node_index(const input_type &x) const {
-        const std::size_t i_sub = get_linear_bin(x);
-        return subtree_node_offsets_[i_sub] + subtrees_[i_sub].get_node_index(x);
-    }
 
     /// Batch evaluation: n_trg points written into res.
     ///
@@ -1176,7 +1152,7 @@ class Function {
                     in_domain = false;
             });
             const std::uint32_t id = in_domain
-                ? leaf_index_by_global_node_[get_global_node_index(xi)]
+                ? subtrees_[get_linear_bin(xi)].find_node(xi).poly_eval_id
                 : ood_id;
             leaf_ids[i] = id;
             ++counts[id];
@@ -1315,8 +1291,6 @@ class Function {
 
     std::vector<detail::PolyTree<Degree, Func>> subtrees_;
     detail::Value<std::size_t, input_dim> n_subtrees_{};
-    std::vector<std::size_t> subtree_node_offsets_;
-    std::vector<std::uint32_t> leaf_index_by_global_node_;
     dim_array_t inv_bin_size_{};
 
     std::vector<poly_eval_type> polyfits_;
