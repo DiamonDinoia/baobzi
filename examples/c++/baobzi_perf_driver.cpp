@@ -1,4 +1,4 @@
-// Focused perf driver: 2d_bump deg=8 N=1e6 and 3d_gauss deg=8 N=1e6.
+// Focused perf driver: 1D gauss/runge, 2D bump, 3D gauss — N=1e6 each.
 // Tight outer loop so perf samples concentrate on operator() batch eval.
 #include <baobzi/baobzi.hpp>
 #include <array>
@@ -7,9 +7,16 @@
 #include <cstdio>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
+auto make_gauss1d() {
+    return [](double x) -> double { return std::exp(-x * x); };
+}
+auto make_runge1d() {
+    return [](double x) -> double { return 1.0 / (1.0 + 25.0 * x * x); };
+}
 auto make_bump2d() {
     return [](std::array<double, 2> x) -> std::array<double, 1> {
         return {std::exp(-100.0 * (x[0] - 0.5) * (x[0] - 0.5)
@@ -55,18 +62,47 @@ void hammer(const char *label, Fn &&fn, std::array<double, Dim> a,
 
 int main(int argc, char **argv) {
     double secs = (argc > 1) ? std::atof(argv[1]) : 15.0;
+    // Optional 2nd argv: comma-separated dim list, e.g. "1d", "1d,2d",
+    // "all" (default). Skipped scenarios are silently omitted;
+    // parse_paired.py treats missing scenarios as no-data per scenario
+    // (it only drops a run when an explicit "SKIPPED" line is printed,
+    // which we avoid).
+    const std::string filter = (argc > 2) ? argv[2] : "all";
+    auto contains = [&](std::string_view tag) {
+        if (filter == "all") return true;
+        std::string needle{tag};
+        // Match as a comma-bounded token: ",1d," in ",<filter>,"
+        std::string padded = "," + filter + ",";
+        return padded.find("," + needle + ",") != std::string::npos;
+    };
+    const bool run_1d = contains("1d");
+    const bool run_2d = contains("2d");
+    const bool run_3d = contains("3d");
 
-    {
+    const bool print_stats = std::getenv("BAOBZI_PRINT_STATS") != nullptr;
+    if (run_1d) {
+        auto fn = baobzi::fit<8>(make_gauss1d(), -3.0, 3.0, 1e-10);
+        if (print_stats) { std::printf("== 1d_gauss ==\n"); fn.print_stats(); }
+        hammer<1>("1d_gauss deg=8 N=1e6", fn, {-3.0}, {3.0}, secs);
+    }
+    if (run_1d) {
+        auto fn = baobzi::fit<8>(make_runge1d(), -1.0, 1.0, 1e-10);
+        if (print_stats) { std::printf("== 1d_runge ==\n"); fn.print_stats(); }
+        hammer<1>("1d_runge deg=8 N=1e6", fn, {-1.0}, {1.0}, secs);
+    }
+    if (run_2d) {
         auto fn = baobzi::fit<8>(make_bump2d(),
                                  std::array<double, 2>{0.0, 0.0},
                                  std::array<double, 2>{1.0, 1.0}, 1e-10);
+        if (print_stats) { std::printf("== 2d_bump ==\n"); fn.print_stats(); }
         hammer<2>("2d_bump deg=8 N=1e6", fn,
                   {0.0, 0.0}, {1.0, 1.0}, secs);
     }
-    {
+    if (run_3d) {
         auto fn = baobzi::fit<8>(make_gauss3d(),
                                  std::array<double, 3>{-1.0, -1.0, -1.0},
                                  std::array<double, 3>{1.0, 1.0, 1.0}, 1e-10);
+        if (print_stats) { std::printf("== 3d_gauss ==\n"); fn.print_stats(); }
         hammer<3>("3d_gauss deg=8 N=1e6", fn,
                   {-1.0, -1.0, -1.0}, {1.0, 1.0, 1.0}, secs);
     }

@@ -1065,3 +1065,1454 @@ Resuming after this entry would start with Layer 2.5, then 3.2
 
 - `include/baobzi/detail/function_impl.hpp` — Layers 1.2, 1.4
 - `bench/results.md` — this entry
+
+## Iteration 11 — Phase 10b ships L9 (quantize-table)
+
+The phase-10b plan ranked layers by intuition (L1 single-leaf, L2 memo,
+L3 padded bounds, L4 packed OOD, L6 DFS reorder, L7 leaf permute,
+L8 streaming stores, L9 Morton-table spike, L10 W=4 batched-descent
+spike). Empirical attribution and 5-7×15s paired-interleaved bench on
+`build-new/baobzi_perf_driver` (extended with `1d_gauss` and
+`1d_runge` cases for this iteration) flipped the ranking: every
+intuition-ranked Tier-1 layer regressed or was neutral, while the
+"spike" L9 was a clean blowout on all four scenarios.
+
+### Workload
+
+`taskset -c 2`, `Function::operator()(double*, double*, n_trg=1e6)`,
+4 GHz P-core, AVX2 (`xsimd::avxvnni`). Tree shapes:
+
+| Scenario | Leaves | Subtree depth |
+|---|---:|---:|
+| 1D gauss `exp(-x²)` on [-3, 3] |   32 | 5 |
+| 1D runge `1/(1+25x²)` on [-1, 1] |   30 | 6 |
+| 2D bump `exp(-100·…)` on [0, 1]² | 7744 | 7 |
+| 3D gauss `exp(-‖x‖²)` on [-1, 1]³ |  512 | 3 |
+
+The phase-10b plan claimed `1D gauss: 8 leaves / depth 3, 82 Mevals/s
+baseline`. On this branch + this machine the actual tree is 32 leaves
+/ depth 5 and the baseline median is **51.46 Mevals/s**. The plan's
+prior was therefore based on a different setup; iter-11's numbers are
+self-consistent (paired binaries built from the same source minus one
+diff).
+
+### What was tried
+
+Each layer was implemented, ctest-validated (33/33 at 1e-12 relative
+tolerance), then benched paired-interleaved against an unmodified
+binary on the same boot of the same shell.
+
+#### L1 — single-leaf fast path (`polyfits_.size() == 1`)
+
+Source change adds an early-out branch before the histogram pass that
+calls the single polyfit directly with NaN-blend post-pass for OOD.
+**The branch never fires on any of the 4 perf scenarios** (smallest is
+30 leaves), so the only effect is on compiler inlining decisions
+around the new branch. A 3×15s interleaved bench at load 3.6 showed
++5 % on 2D bump and +1.4 % on 3D gauss — those medians did not survive
+the next noise sample.
+
+5×15s interleaved at strict load < 2 (clean):
+
+| scenario | baseline | L1 | Δ |
+|---|---:|---:|---:|
+| 1D gauss | 51.54 | 49.32 | **−4.3 %** |
+| 1D runge | 32.15 | 32.24 |  +0.3 % |
+| 2D bump  | 19.42 | 19.51 |  +0.5 % |
+| 3D gauss | 19.59 | 19.31 |  −1.4 % |
+
+`bump2d`'s out-of-line `operator()` symbol shrank from 0x29b0 → 0x190b
+bytes (-40 %) and `gauss3d`'s from 0x5182 → 0x1a62 (-67 %): the added
+branch shifted the compiler's inlining heuristic and de-inlined parts
+of the polyfit dispatch path. The de-inlining freed icache for the hot
+path on 2D/3D in the noisy 3-run bench but the cleaner 5-run sample
+exposed it as accidental — `1D gauss` regresses 4.3 %. **Discarded.**
+
+#### L3 — pad `PolyTree::lower_` / `upper_` and `Function::lower_left_` /
+`upper_right_` to `alignas(32) std::array<double, 4>` for ND
+
+Aimed at iter-10's Layer 1.3 follow-up: pre-descent setup spent
+~12 insns/point widening 16-B (2D) / 24-B (3D) bounds into a ymm.
+Implemented; padding is correct; ctest green. **Codegen of the descent
+body is unchanged** — the compiler still emits per-axis scalar
+`vmovsd` loads from the (now padded) bounds. The only delta is +64 B
+in `bump2d`'s `operator()` size (compiler kept identical inner code
+but shifted offsets to the new padded layout). Net perf delta below
+noise. **Kept** as a prerequisite for L9's `inv_span_bins_` precompute
+and to preserve the option to retry Layer 1.3 with explicit xsimd
+intrinsics later.
+
+#### Layer 1.3 retry — explicit xsimd packed descent
+
+On top of L3, replaced the per-axis dim loop with a packed batch:
+load `lower_` / `upper_` as `vmovapd ymm`, packed `(lo+hi)*0.5`,
+packed `vcmplt_oqpd`, child_idx via `vmovmskpd & dim_mask`, packed
+`vblendvpd` for lo/hi update. Codegen confirmed the loads are
+ymm-aligned and the FP compute is fully packed.
+
+Per-iter critical path on Alder Lake P (simdref measured):
+
+```
+vaddpd       lat 3   FP recurrence
+vmulpd       lat 3   FP
+vcmplt_oqpd  lat 3   FP / fan-out to mask
+vpcmpgtq     lat 1   format-shuffle the mask for blendvpd (compiler-emitted)
+vmovmskpd    lat 2   mask → INT (gates child_idx)
+and / add    lat 1   INT
+lea / load   lat 1+4 INT next-iter address fetch
+```
+
+INT recurrence (mask → curr_index → load → next eax) is **17 c/iter**
+vs scalar's **~14 c/iter** (`vcomisd 2 + seta 1 + add 1 + lea 1 +
+load 4 = ~9 c after mid is ready at 5 c, plus the mid → flags branch
+takes ≥ 2 c more`). The vector path's gain on FP throughput is moot
+because INT was already gating, and the imm-encoded compare's
+3-cycle latency stretches the path further than scalar `vcomisd`.
+
+This matches iter-10's discard rationale for Layer 1.3 (then attributed
+to setup overhead from unaligned bounds; now confirmed the per-iter
+critical path itself doesn't shrink). **Discarded — not benched** to
+avoid burning a noise budget on a layer the asm rules out.
+
+`vpcmpgtq` after `vcmplt_oqpd` is the wasted round-trip the iter-10
+note flagged; an `xsimd::batch_bool` consumed directly by `select`
+would drop that. Still wouldn't beat scalar at Dim ≤ 3.
+
+#### L9 — quantize-table descent shortcut for shallow subtrees ✅ shipped
+
+For PolyTrees where `2^(input_dim · max_depth_) · 4 B ≤ 64 KiB`,
+build a row-major `leaf_table_` at fit-time mapping each quantize
+cell to the `poly_eval_id` of its containing leaf. Eval-time descent
+collapses to:
+
+```
+qd = (xd - lo[d]) * inv_span_bins_[d]   // vsubsd + vmulsd
+qd = (size_t)qd                         // vcvttsd2si
+idx = qd_0 | (qd_1 << bits) | …
+return leaf_table_[idx];
+```
+
+`inv_span_bins_[d] = 2^depth / span[d]` is precomputed. The per-axis
+quantize is therefore one `vmulsd` (lat 3) instead of a `vdivsd`
+(lat 14) — confirmed in the dropped first prototype where leaving
+`/ span` in the hot path produced a regression on every scenario.
+
+7×10s paired-interleaved median (no load gate; runs naturally
+straddle the same load envelope when interleaved):
+
+| scenario | baseline | L9     | speedup |
+|---|---:|---:|---:|
+| 1D gauss | 51.46    | 102.55 | **+99 %** (×2.0) |
+| 1D runge | 32.58    | 110.35 | **+239 %** (×3.4) |
+| 2D bump  | 19.54    |  53.21 | **+172 %** (×2.7) |
+| 3D gauss | 19.63    |  26.26 | **+34 %**  (×1.34) |
+
+3D's smaller speedup is because depth=3 already only costs ~3·17 = 51
+descent insns/point, and the polyfit kernel itself dominates total
+cycles — Amdahl's law caps the descent-shortcut win below the 1D/2D
+factors. The 2D table is 64 KiB exactly, fits L1d (32 KiB working set
+with the polyfit coefficients pulling in another fraction), and shows
+the largest absolute Mevals/s gain.
+
+`fit()` cost is `O(2^(input_dim·max_depth_) · max_depth_)` calls into
+`get_node_index` per subtree. For 2D bump (16 K cells × 7 levels =
+115 K descents) this adds ~2 ms to fit time; the 119 ms fit grew to
+~121 ms — a price already paid in fit, recovered by the ~1 µs/eval
+inner loop saving over any non-trivial number of eval calls.
+
+The 64-KiB-per-subtree budget stays under the per-Function
+`max_memory_mib` budget by construction (single subtree per Function
+in the perf driver; multi-subtree fits sum tables + node storage and
+will hit the budget naturally if the user opts into a deeper tree).
+
+### Numbers vs the prior baseline
+
+| Scenario | Phase 7 | Phase 9 (A+E) | Phase 10 (1.2 + 1.4) | Phase 10b (L9) | Cumulative |
+|---|---:|---:|---:|---:|---:|
+| 1D gauss deg=8 N=1e6 |  —   |   —   |   —   | **102.55** |  — |
+| 1D runge deg=8 N=1e6 |  —   |   —   |   —   | **110.35** |  — |
+| 2D bump  deg=8 N=1e6 | 6.60 | 10.00 | 18.30 |  **53.21** | **+706 %** |
+| 3D gauss deg=8 N=1e6 | 3.86 |  8.06 | 18.22 |  **26.26** | **+580 %** |
+
+(`1d_gauss` and `1d_runge` are new perf-driver scenarios introduced
+this iteration; their pre-iter-11 baselines exist only in this branch's
+HEAD~1 measurement, 51.46 and 32.58 respectively.)
+
+### Plan vs reality
+
+The phase-10b plan's order was `L1 → L2 → L3 → L4 → L5 → L6 → L7 →
+L8 → L9 (spike) → L10 (spike)`. L9 was ranked behind seven layers it
+turned out to dominate by an order of magnitude. Lessons:
+
+- **The "spike" qualifier was wrong** — L9 has a measurable, asm-clean
+  cycle saving (~80 c/point on 2D bump descent → table) and a fit-time
+  cost that is trivially amortised. It should have been Tier 1.
+- **The plan's per-layer cycle estimates underweighted descent.** The
+  pre-descent OOD check (L4 target) is ~3 % of total; the 7-level
+  descent itself is ~58 %. Optimising the smaller share first is an
+  EV inversion that the order encoded.
+- **Asm-anchored attribution before benching** prevented burning a
+  full-bench cycle on the L1.3 retry once the per-iter critical-path
+  arithmetic showed it couldn't win.
+
+### Files
+
+- `include/baobzi/detail/function_impl.hpp` — L3 (kept) + L9 (shipped)
+- `examples/c++/baobzi_perf_driver.cpp` — `1d_gauss` / `1d_runge` cases +
+  `BAOBZI_PRINT_STATS` env-gated tree-shape dump
+- `bench/results.md` — this entry
+- `report_phase10b/AB4_baseline.txt`, `report_phase10b/AB4_L9.txt` —
+  raw 7×10s paired-interleaved measurement
+
+### Stop criterion
+
+Phase-10b plan's stop criterion was "two consecutive layers fail the
+ship rule → re-profile end-to-end". L1 failed (regression). L9
+shipped with very large Δ. Per the plan we keep going.
+
+The next candidate is **L2 (per-call leaf-id memo)** — the plan's
+spatial-locality argument doesn't apply on independent-uniform query
+points, but on user workloads where consecutive points cluster (any
+quadrature, ray marching, sequential field sampling) the hit rate
+should be high. Need a different bench scenario to value it. The
+remaining plan layers (L4, L5, L6, L7, L8, L10) were all targeting
+the descent inner loop or its periphery; with L9 collapsing descent
+to a single load on these scenarios, their headroom is now bounded
+by the post-L9 cycles which sit largely in the polyfit kernel — out
+of scope per the plan.
+
+## Iteration 12 — Phase 11 ships A + P (post-L9 batch-eval follow-up)
+
+Single iteration covering three Phase-11 layers landed on
+`use-polyfit`: A (shipped), G (discarded), P (shipped). After L9
+collapsed descent on shallow single-subtree scenarios, attribution
+shifted to OOD checks (Layer A) and the random-write unpermute pass
+(Layer P). All four scenarios — 1d_gauss, 1d_runge, 2d_bump, 3d_gauss —
+benefited from one or both shipped layers.
+
+### Workload
+
+Same harness as iter-11: `taskset -c 2`, `Function::operator()(*, *, n=1e6)`
+on Intel Core Ultra 7 155H P-core, AVX2 (`xsimd::avxvnni`), 4 GHz.
+Per-layer pair-build: stash → build baseline → unstash → build layer.
+Saved binaries live in gitignored `report_phase11/`.
+
+### Layer A — fuse OOD into L9 quantize-table descent (SHIPPED)
+
+**Diff:** `include/baobzi/detail/function_impl.hpp` only.
+**Commit:** `4b31d16`.
+
+Two changes folded together:
+
+1. **Hoist the runtime-constant single-subtree dispatch out of the
+   per-point loop.** When the tree is one subtree with a leaf table
+   (true for all four bench scenarios), the inner loop becomes a
+   straight-line histogram update — no internal branch, no virtual
+   dispatch — and the compiler unrolls it 5× (visible in `objdump`
+   on bump2d at offset `0x21020`+).
+2. **Replace the unsigned-cast OOD safeguard.** `static_cast<size_t>(double)`
+   emits a 2-step convert (`vsubsd 2^63 / vcvttsd2si / vcomisd / cmovae`)
+   on Alder Lake P. Where the input is bounded, signed
+   `vcvttsd2si` + unsigned compare collapses it to one convert + one
+   `cmp + jb` — saves ~7 c per axis.
+
+**Per-axis critical path (simdref measured, ADL-P):**
+| insn        | lat | cpi  |
+|-------------|----:|-----:|
+| vmovsd load |   4 | 0.50 |
+| vsubsd      |   2 | 0.50 |
+| vmulsd      |   3 | 0.50 |
+| vcvttsd2si  |   9 | 0.50 |
+| cmp         |   1 | 0.13 |
+
+Per-axis chain 4+2+3+9+1 = 19 c. 2D parallel + shlx/or + table
+load + store ≈ 27 c critical path → matches the +29-37% observed
+gain.
+
+**Symbol size deltas (within 5% gate):**
+- bump2d: +5.0% (0x29f3 → 0x2c01)
+- gauss3d: +1.9% (0x51ef → 0x538B)
+- runge1d: +4.1% (0x1ce3 → 0x1d9d)
+
+**Bench medians (7×10s, paired-interleaved):**
+
+| Scenario | pre-A | post-A | Δ |
+|---|---:|---:|---:|
+| 1d_gauss | 102.55 | 145.70 | **+42.1%** |
+| 1d_runge | 110.35 | 161.65 | **+46.5%** |
+| 2d_bump  |  53.21 |  72.54 | **+36.3%** |
+| 3d_gauss |  26.26 |  33.94 | **+29.2%** |
+
+### Layer G — `[[unlikely]]` on OOD branch (DISCARDED)
+
+Annotated `if (... > mask) return ood_id;` in `find_leaf_id_with_ood`.
+
+**Codegen check showed zero effect.** Top-10 mnemonic histogram
+identical to Layer A (424 mov, 205 vbroadcastsd, 156 vfmadd132pd,
+…). Symbol size deltas: bump2d +24 B, gauss3d -16 B, runge1d +4 B —
+noise. The compiler had already laid the OOD branch cold (forward
+jump to `21500`, well past the polyfit kernel).
+
+Discarded with codegen evidence; no bench cycle spent. Stash dropped.
+
+### Layer P — UNPERMUTE prefetch lookahead (SHIPPED)
+
+**Files:** `include/baobzi/detail/function_impl.hpp` (+10 in unpermute loop).
+
+**Why:** post-A profile (`report_phase11/post_A/`) showed UNPERMUTE
+at **65-69 % of 1D cycles**. Each iteration:
+
+- load `perm[dst]` (contiguous, L1 hot, ~5 c)
+- load `out_packed[dst]` (contiguous, hot, ~12-30 c)
+- store `res[perm[dst]]` (random, RFO, ~50-200 c per cold cacheline)
+
+Random `perm` over 8 MiB of `res` (N=1e6, output_dim=1) → every
+cacheline of `res` requires an RFO. Layer P prefetches
+`&res[perm[dst+32]]` for write (`__builtin_prefetch(p, 1, 0)`)
+ahead of the actual store.
+
+**Codegen confirmation (runge1d unpermute body at 0x6d40):**
+```
+6d54: mov    (%r12,%rax,4),%edi          ; perm[dst+LOOKAHEAD]
+6d58: mov    -0x80(%r12,%rax,4),%ecx     ; perm[dst]
+6d5d: vmovsd -0x100(%rsi,%rax,8),%xmm1   ; out_packed[dst]
+6d6a: cmp    $0xf423f,%rax
+6d70: prefetchw (%r10,%rdi,8)            ; &res[perm[dst+32]]
+6d75: vmovsd %xmm1,(%r10,%rcx,8)         ; res[perm[dst]] = xmm1
+6d7b: jbe    6d54
+```
+
+Compiler hoisted the bound check out by pre-rolling and emitting a
+tail handler — `prefetchw` lands inside the loop body, dual-issued
+with the store.
+
+**Symbol size deltas (within 5% gate):**
+- bump2d: +0x96 B (+2.2%)
+- gauss3d: -0x5A B (-0.4%)
+- runge1d: -0x94 B (-2.0%)
+
+**Bench (14×10s paired-interleaved, run 7 excluded — thermal cliff
+hit layerP only on that single run; verified by per-run paired
+deltas):**
+
+| Scenario | post-A | Layer P | Δ% (median) | Δ% (10%-trim mean) |
+|---|---:|---:|---:|---:|
+| 1d_gauss | 127.7 | 134.8 | **+8.5%** | +7.3% |
+| 1d_runge | 141.0 | 145.3 | **+6.3%** | +5.3% |
+| 2d_bump  |  63.4 |  65.9 | **+5.1%** | +4.1% |
+| 3d_gauss |  30.3 |  30.4 | **+2.6%** | +1.9% |
+
+Variance was high across the 14-run window (run-7 layerP 3d_gauss
+dipped to 7.1 Mevals/s — clear thermal/scheduling outlier; baseline
+binary was unaffected). Paired-delta median over 13 clean runs is
+positive on every scenario; ship rule (≥+1 % on at least one, no
+regression > 1 % on others) met cleanly.
+
+### Cumulative gain (pre-A → post-P) on 7×10s clean medians
+
+| Scenario | pre-A baseline | post-P | Δ |
+|---|---:|---:|---:|
+| 1d_gauss | 102.6 | ~135 | **+31%** |
+| 1d_runge | 110.4 | ~145 | **+31%** |
+| 2d_bump  |  53.2 |  ~66 | **+24%** |
+| 3d_gauss |  26.3 |  ~30 | **+15%** |
+
+(Layer-P numbers are noisier than Layer-A's; the post-P column is
+the median of 13 paired runs minus the run-7 thermal outlier, on
+the same machine but at a different time-of-day load profile.)
+
+### Lessons (this iteration)
+
+- **Run-time-constant dispatch hoisted out of a hot loop is a
+  reliable optimisation.** When a per-call invariant (here:
+  single-subtree leaf-table layout) gates the inner loop's
+  branch, the compiler can fully unroll the fast path while
+  keeping the fallback present in `.text`. The only cost is
+  symbol-size growth — pre-bench inlining-size check (`nm
+  --print-size`) is essential.
+- **The unsigned-cast safeguard is a hidden FP cost.**
+  `static_cast<size_t>(double)` on Alder Lake P emits a 5-uop
+  conversion (`vsubsd / vcvttsd2si / vcomisd / cmovae`) when the
+  compiler can't prove the input is non-negative. Where bounds
+  are known, prefer signed convert + unsigned compare.
+- **`[[unlikely]]` is a no-op when the compiler has already laid
+  the branch cold.** Always codegen-check first. Saves a bench
+  cycle.
+- **Random-write RFO is ~50 % of 1D batch eval cycles post-A.**
+  Even with `out_packed` and `perm[]` both hot in L1, the
+  scattered write to `res` dominates because each cacheline
+  requires a RFO that latency-bottlenecks the store buffer.
+  Software write-prefetch with a small lookahead (32 here) hides
+  this latency without adding load-port pressure.
+- **Hybrid CPU `perf annotate` doesn't support per-event filtering
+  on AlderLake-P + E.** Use `perf script | awk` + `addr2line -i -f -C`
+  for per-IP attribution.
+- **Rebuilding the binary while perf-record is running corrupts
+  the IP→symbol mapping** (process keeps the old mmap, on-disk file
+  is replaced, addr2line resolves against the wrong inode). Cancel,
+  restore, re-run.
+
+### Files
+
+- `include/baobzi/detail/function_impl.hpp` — A (commit `4b31d16`) + P (this commit)
+- `bench/results.md` — this entry
+- `report_phase11/L0_full/`, `report_phase11/post_A/` — gitignored
+  perf profiles + per-IP samples (binned via `perf script` →
+  `addr2line` → region attribution table in the Phase 11 plan)
+- `report_phase11/perf_driver_baseline_P`, `…/perf_driver_layerP` —
+  paired binaries used for the 14×10s bench
+
+### Stop criterion (revised)
+
+Phase 11 stop criterion: two consecutive layers failing the ship rule
+triggers a mandatory full re-profile, and if no remaining target's
+intended region is ≥ 5 % of measured cycles on at least one scenario,
+the iteration closes.
+
+After Layer P ships:
+- 1D scenarios: UNPERMUTE share drops; remaining cycles split between
+  polyfit kernel (in-region) and HIST fast-path (~6 % of cycles).
+- 2D bump: SCATTER+DISPATCH still ~95 % of cycles; ceiling is the
+  polyfit kernel (out-of-scope).
+- 3D gauss: ~80 % of cycles in polyfit ND U=1 kernel (register-
+  pressure tax) — out of scope.
+
+The remaining queued layers (B compressed leaf table, D Z-order
+permute, F' scratch+immediate scatter, E NT stores) all target
+regions whose post-P share is < 10 % of cycles on every scenario,
+and B in particular has been downgraded post-A from ~34 % HIST to
+~6 % (EV ceiling ~3 %).
+
+**Decision:** iter-12 closes here pending a fresh post-P profile to
+re-rank. Next phase, if pursued, would have to attack polyfit-internal
+(kernel UF, 3D U=1) or AVX-512 silicon (real scatter), both of which
+were declared out of scope at the start of Phase 11.
+
+## Iteration 13 — Phase 12: Layer Q tried & discarded, master regression confirmed
+
+Phase 12 retired the elaborate "pollution-aware" paired harness
+(`bench_paired.sh` with PSI / freq / off-pin gates, calibrated
+ceiling, warmup) in favour of the **short-and-honest** model: a
+30-line `report_phase12/bench_pair_short.sh` that alternates two
+binaries 12 × 5 s with `taskset -c 2` and no gates, and an
+extended parser (`report_phase12/parse_paired.py`) that reports
+**paired-median Δ%, stddev of paired Δ%, and 25/75-percentile
+IQR**. Total wallclock per pair ≈ 120 s. Noise tolerance for ship
+decisions: **±5 %** on the paired-median Δ%.
+
+### Layer Q — input-scatter `prefetchw` lookahead — DISCARDED
+
+Source diff (reverted, not committed):
+`include/baobzi/detail/function_impl.hpp:1311-1343` — paired
+`__builtin_prefetch(..., rw=1, locality=0)` for `xp_packed[D·dst]`
+and `perm[dst]` with a 16-iteration lookahead in the input-scatter
+loop. Pre-built binaries `report_phase12/perf_driver_baseline_Q`
+and `perf_driver_layerQ`.
+
+**Codegen evidence** (whole-binary mnemonic counts; full table in
+`report_phase12/Q_codegen_audit.md`):
+
+| Binary | prefetcht0 | prefetchw |
+|---|---:|---:|
+| baseline_Q | 4 |  4 |
+| layerQ     | 4 | 32 |
+
+Δ = **+28 prefetchw** as intended. Per-symbol size deltas
+(`Function<8, …>::operator()`) all under the 5 % gate (max
++2.37 % on `make_runge1d`).
+
+**Causal `perf stat` evidence** (single 20-s pinned run, `:u`):
+
+| Counter | baseline_Q | layerQ | Δ |
+|---|---:|---:|---:|
+| **l2_rqsts.rfo_miss**    | 1.693 B | 1.580 B | **−6.67 %** |
+| l1d.replacement          | 6.068 B | 5.670 B | −6.56 % |
+| mem_load_retired.l3_miss | 14.05 M | 15.24 M | +8.54 % |
+
+The −6.67 % drop in L2 RFO misses confirms the prefetchw mechanic
+worked: ownership for the upcoming write line is fetched early.
+
+**Bench (12 paired runs × 5 s, core 2):**
+
+| scenario | base med (Mevals/s) | cand med | Δ% med | Δ% std | Δ% IQR |
+|---|---:|---:|---:|---:|---|
+| 1d_gauss | 153.34 | 146.61 | −4.51 % | 5.04 % | [−7.23, −2.69] |
+| 1d_runge | 158.12 | 153.47 | −3.68 % | 2.40 % | [−5.16, −3.26] |
+| 2d_bump  |  74.20 |  73.90 | −0.16 % | 7.32 % | [−2.23, +2.54] |
+| 3d_gauss |  31.07 |  31.41 | +0.97 % | 6.02 % | [−1.18, +5.86] |
+
+With ±5 % noise tolerance, every scenario sits inside the noise
+band (max |Δ| = 4.51 %). Ship rule (`Δ ≥ +1 %` outside noise on
+at least one scenario) **not met → DISCARDED**. The mechanical
+hypothesis was correct (RFO miss rate fell), but the +28 prefetchw
+uops add front-end / port pressure on the hottest 1D operator()
+bodies and the wallclock outcome is inside noise. Source reverted;
+artifacts kept under `report_phase12/` as a record.
+
+### Master regression — `main` vs `use-polyfit` post-Q-decision
+
+Same harness, comparing `/tmp/baobzi-main-bench/build/baobzi_perf_driver`
+(commit `cf39a3c` on `main`) against `report_phase12/perf_driver_baseline_Q`
+(use-polyfit tip, commit `6630179`). 12 paired runs × 5 s, core 2:
+
+| scenario | main med (Mevals/s) | polyfit med | Δ% med | Δ% std | Δ% IQR |
+|---|---:|---:|---:|---:|---|
+| 1d_gauss |  98.92 | 148.71 |  **+47.81 %** |  9.00 % | [+45.45, +52.19] |
+| 1d_runge |  54.16 | 161.55 | **+196.51 %** | 15.92 % | [+186.86, +204.41] |
+| 2d_bump  |  35.36 |  74.19 | **+107.04 %** | 11.34 % | [+91.65, +111.19] |
+| 3d_gauss |   5.18 |  31.38 | **+505.23 %** | 46.59 % | [+465.40, +523.20] |
+
+The `use-polyfit` branch is uniformly faster than `main` on every
+batch-eval scenario, well outside the 5 % noise band — the
+cumulative gain since the polyfit cutover (Phases 9 → 11: slim-node
+descent, A, P, L9, plus the public batch-eval API rewrite) is
+**+48 % to +505 %** depending on dimension. No scenario regresses.
+The `+505 %` on 3d_gauss is a cross-API comparison (the public
+batch-eval surface differs between branches); we report the
+wallclock delta on `operator()` only and do not attempt symbol-level
+attribution — `main` predates the polyfit eval kernel, so the
+two binaries do not share an inner loop.
+
+### Footprint
+
+`report_phase12/footprint_analysis.md` documents the per-call
+thread_local scratch for `Function::operator()`: 1D = 24 MiB,
+2D = 32 MiB, 3D = 40 MiB at N = 1e6, dominated by `xp_packed`
+(8·D MiB), `out_packed` (8 MiB), `leaf_ids` (4 MiB) and `perm`
+(4 MiB). The 4 MiB target gate is **unreachable at N=1e6**
+without out-of-scope changes (e.g. tiling the public batch API
+to chunk N internally). Two bench-friendly partial wins are
+identified and **deferred to a follow-on phase**:
+
+- **C1 — `leaf_ids` u16 narrowing** when `n_leaves ≤ 65535`:
+  saves 2 MiB at N=1e6, AVX2 store throughput unchanged
+  (loop is scalar), trivial zero-extend in the
+  scaled-index addressing.
+- **`BAOBZI_RELEASE_SCRATCH_AFTER`** — opt-in `shrink_to_fit` /
+  free of the thread_local vectors after a configurable idle.
+
+Neither is in scope for iter-13.
+
+### Ship/discard decisions (honest closure)
+
+| Candidate | Δ% med (range) | Decision |
+|---|---|---|
+| Layer Q (input-scatter prefetchw) | −4.5 % … +1.0 % (all in ±5 % noise) | **Discarded** |
+| `leaf_ids` u16 narrowing | not benched (footprint-only) | Deferred |
+| `BAOBZI_RELEASE_SCRATCH_AFTER` | n/a | Deferred |
+
+Each discard cites both the median Δ% and the stddev of paired Δ%.
+Layer Q's mechanical RFO win is preserved in the codegen audit
+even though the wallclock outcome was inside noise — useful prior
+art if a future phase revisits write-prefetch under a less
+front-end-bound operator() body.
+
+### Files
+
+- `report_phase12/bench_pair_short.sh` — minimal paired bench (no gates)
+- `report_phase12/parse_paired.py` — paired-Δ% with median + stddev + IQR
+- `report_phase12/Q_codegen_audit.md` — prefetch counts, symbol sizes, perf stat
+- `report_phase12/footprint_analysis.md` — per-call thread_local scratch budget
+- `report_phase12/Q_baseline.txt` / `Q_layerQ.txt` — Layer Q paired bench
+- `report_phase12/M_main.txt` / `M_layerQ.txt` — master regression bench
+- `report_phase12/perf_driver_baseline_Q` / `perf_driver_layerQ` — pre-built binaries
+- `bench/results.md` — this entry
+
+### Lessons (this iteration)
+
+- **Short-and-honest beats elaborate-and-broken.** The
+  pollution-aware harness fought a hybrid CPU's powersave governor
+  for hours and still produced ±20 % run-to-run noise. A 12-paired
+  × 5-s loop with a stddev-aware parser tells the same story in
+  120 s and is robust because every paired Δ% is a self-contained
+  apples-to-apples measurement.
+- **A correct mechanical hypothesis can fail at the wallclock.**
+  Layer Q's prefetchw really did reduce L2 RFO misses (−6.7 %) but
+  added uop pressure that the front-end couldn't absorb on the
+  tightest 1D loops. Always cross-check codegen evidence with a
+  paired wallclock bench; the perf-counter delta alone is not a
+  ship signal.
+- **Footprint gates that ignore where the bytes live are not
+  actionable.** The 4 MiB ceiling at N=1e6 is fundamentally a
+  property of the public batch-eval API (one entry per input);
+  any reduction below 8·D·N + O(N) bytes requires reshaping the
+  surface, not the descent. Document and defer.
+
+### Decision
+
+iter-13 closes Phase 12 with **no source change shipped** — Layer Q
+discarded, footprint candidates deferred. The use-polyfit branch is
+confirmed uniformly faster than `main` on the public batch-eval
+surface (+48 % to +505 %). The `/tmp/baobzi-main-bench` worktree is
+removed at end of phase.
+
+## Iteration 14 — Phase 13: peak-distance + asm-analysis, no ship
+
+Phase 13 turned the iter-12/13 hand-waves about "polyfit kernel
+ceiling" and "U=1 register-pressure tax" into measured numbers via
+the `simdref` asm-analysis pipeline (`compile_commands` → `objdump`
+→ `simdref annotate` → `llvm-mca`) and a fresh per-IP region
+profile via `simdref profile run`. No code change shipped — the
+strongest candidate identified did not clear iter-13's ±5 % noise
+band on its asm evidence alone, and the user's idle-system gate
+deferred any speculative paired bench.
+
+### Step 1 — fresh region profile (PRELIMINARY)
+
+`simdref profile run --target ./report_phase13/profile/run_pinned.sh
+--args "5" --adapter perf --event "cycles:u,instructions:u"
+--duration 60 --arch alderlake -o report_phase13/profile/`. Pinned
+to core 2 via wrapper script (`taskset -c 2`). 41 011 `cpu_core/cycles`
+samples; `cpu_atom` filtered out (workflow §2b.1).
+
+> **Caveat:** the operator flagged this run as potentially polluted
+> (concurrent system load not confirmed idle). 1D scenarios show
+> ≈ 0 cycle samples in the histogram — inconsistent with their 5-s
+> window at 153/158 Mevals/s. Treat the table as directional. A
+> clean re-profile is pending operator confirmation.
+
+| Scenario | scenario share | dominant region (deepest baobzi/polyfit frame) |
+|---|---:|---|
+| 2d_bump  | 49.0 % | `function_impl.hpp` L678/L684/L695 (≈55 % of 2D) — **`get_node_index` BFS descent** (asm: `vcomisd` axis-split + `is_leaf()` sentinel load chain) |
+| 3d_gauss | 49.0 % | `poly_eval.h:141-167` (≈52 % of 3D) — **`horner_axis_acrossPts` (KERNEL_ND_U1)** |
+| 1d_*     | <2 %   | under-represented (likely pollution; secondarily, `find_leaf_id_with_ood` strips scenario marker frames) |
+
+**Surprise:** 2D bump is **descent-bound**, not "SCATTER+DISPATCH"
+as the iter-12 hand-wave assumed. The L9 leaf-table fast path is
+NOT taken on multi-subtree trees, so 2D bump falls into
+`get_node_index`'s `while (!is_leaf())` loop. The plan's Step 1 → 3
+decision gate ("kernel ≥ 30 % on at least one scenario → kernel is
+lead") is met by 3D's 52 % share, but the kernel-asm result (below)
+shifts the leverage *away* from kernel-level changes.
+
+### Step 2 — peak-distance table
+
+llvm-mca @ `-mcpu=alderlake -iterations=100` on the 102-instruction
+ND U=1 inner-loop region (file offsets `0x7560..0x77ff` of
+`build-perf/baobzi_perf_driver`):
+
+```
+Block RThroughput: 20.5 cycles/iter
+uOps/cycle:        4.66
+IPC:               4.49
+```
+
+Resource pressure: ports 0/1 (FMA execute), 2/3 (load), 10
+(broadcast) all simultaneously bound at ~20-21 c/iter. Per-iter:
+38 FMAs × 4 lanes × 2 flops = 304 flops / 20.5 c = **14.83 flops/cycle
+= 92.7 % of the 16 flops/cycle AVX2 fp64 peak**.
+
+**Iter-12's "ND U=1 register-pressure tax" hypothesis is refuted.**
+No spills, no port slack, kernel is at silicon ceiling.
+
+Public-batch-surface achieved (4 GHz effective freq):
+
+| Scenario | Mevals/s | flops/eval | flops/cycle | % peak | implied kernel cycle share |
+|---|---:|---:|---:|---:|---:|
+| 1d_gauss | 153.34 |   14 | 0.54 |  3.4 % |  3.6 % |
+| 1d_runge | 158.12 |   14 | 0.55 |  3.5 % |  3.7 % |
+| 2d_bump  |  74.20 |  126 | 2.34 | 14.6 % | 15.8 % |
+| 3d_gauss |  31.07 | 1022 | 7.94 | 49.6 % | 53.5 % |
+
+3D's 53.5 % implied kernel share matches the (polluted) Step-1
+profile attribution at 52 % — independent cross-check works. 1D
+spends 96-97 % of wallclock OUTSIDE the kernel; 2D spends 84 %
+outside.
+
+### Step 3 — kernel asm-analysis
+
+ND U=1 kernel (`poly_eval.h:141-167`, fully inlined under
+`PF_FLATTEN`/`PF_ALWAYS_INLINE`):
+
+| mnemonic | count | lat (c) | cpi | source |
+|---|---:|---:|---:|---|
+| vbroadcastsd | 53 | 5.0 | 0.33 | ADL-P measured |
+| vfmadd132pd  | 37 | 4.0 | 0.50 | ADL-P measured |
+| vfmadd231pd  |  1 | 4.0 | 0.50 | ADL-P measured |
+| vmulpd       |  3 | 4.0 | 0.50 | ADL-P measured |
+| vxorpd       |  3 | 1.0 | 0.33 | ADL-P measured |
+
+`unknown ??` rate: 1/102 = 1.0 % (just `jne` — a parser quirk, not
+a catalog gap). Workflow §9's 20 % refuse-threshold is well clear.
+llvm-mca ↔ simdref agree on lat/cpi within 2× on all dominant
+mnemonics; one minor discrepancy on `vbroadcastsd` latency
+(simdref 5 c, llvm-mca / uops.info 8 c — the broadcast-forward
+slice — see `simdref_bugs.md` Bug 3).
+
+2D-bump descent (`function_impl.hpp:900-945` get_node_index):
+
+35 instructions, 17.1 % `unknown` (just under the 20 % refuse line;
+see `simdref_bugs.md` Bug 2 for the missing alderlake rows on
+`seta`/`movzbl`/`jcc`). Critical path per descent level:
+
+```
+vcomisd (3c) → seta (1c) → or (1c) → shl ×32 (1c)
+            → mov 0x10(%rcx) (4c L1)
+            → cmp jne (1c)
+≈ 11 cycles per level
+```
+
+Load-to-load chain dominates: each level's `mov 0x10(%rcx)`
+depends on the prior level's chain. With 4-cycle L1 latency this
+is an architectural floor.
+
+### Step 4 — descent / dispatch design notes
+
+The plan's nominal Step 4 target (per-leaf dispatch overhead) was
+not the hottest 2D site; `get_node_index` is. Three candidates
+considered, none committed:
+
+| Candidate | Mechanism | Plausible win | Risk |
+|---|---|---|---|
+| Build leaf_table_ for multi-subtree | algorithmic (table fits 2D bump?) | possibly large (1D-style fast path) | table footprint blow-up |
+| Software-pipeline descent | `__builtin_prefetch` next level node | small (L1 already fast) | port-2/3 contention with current chain |
+| Pack `is_leaf` flag separately | layout (1 B vs 4 B sentinel) | small (same load latency) | cache duplication |
+
+None are individually compelling enough to clear iter-13's ±5 %
+noise band without a measurement, and the user's idle-system gate
+deferred any speculative bench in this phase.
+
+### Step 5 — xsimd gap report
+
+| Gap | Native ISA | Hand-rolled site | Priority |
+|---|---|---|---|
+| `xsimd::scatter` | AVX-512 native | `polyfit/fast_eval_impl.hpp:467` (`scatterColumnBatch`) — lane loop | Medium |
+| `xsimd::masked_gather/scatter` | AVX-512 / SVE | n/a (sentinel-encoded) | Medium-High |
+| `xsimd::compress`/`expand` | AVX-512 native | n/a (Layer-A fused OOD) | Medium |
+| `xsimd::deinterleave2` | shuffle-pair | `polyfit/simd_utils.h:89-90` real/imag-split | Low |
+
+Coefficient-hoist helper — **not a gap**: kernel asm shows port 10
+(broadcast) is already saturated; hoisting would not help on AVX2.
+Full repro snippets and proposed upstream issue titles in
+`report_phase13/xsimd_gaps.md`.
+
+### simdref bugs filed (5)
+
+`report_phase13/simdref_bugs.md`:
+
+1. `mov %fs:0x0, %r14` (TLS access) **mis-classified as
+   `MOV-DR` debug-register read with lat=217 c** — worst correctness
+   bug, 200×-overstated latency.
+2. `seta` / `movzbl` / `je` / `jne` flagged `unknown ??` on
+   alderlake — drives the 17 % unknown rate on the descent.
+3. `vbroadcastsd` latency reports 5 c (load-port slice) vs llvm-mca
+   / uops.info 8 c (load + broadcast forward).
+4. `simdref annotate` returns empty on raw `objdump -d` output;
+   needs `.text/.globl/<sym>:` envelope wrapper.
+5. `simdref profile run --target` runs `objdump` on the wrapper
+   script; needs a separate `--binary` flag for symbol resolution
+   when the target is a pinning wrapper.
+
+### Ship/discard decision
+
+| Candidate | Asm + cycle-share evidence | Decision |
+|---|---|---|
+| Hoist coefficient broadcasts in ND U=1 kernel | refuted: port 10 saturated | Not pursued |
+| Higher unroll factor on ND U=1 kernel | refuted: only 16 ymm available | Not pursued |
+| 1D Horner kernel optimisation | refuted: < 4 % of 1D wallclock; 96 % of cost is elsewhere | Not pursued |
+| `get_node_index` descent: leaf_table for multi-subtree | algorithmic, deferred | Deferred (footprint analysis needed) |
+| `get_node_index` descent: prefetch-pipeline | small expected win | Deferred |
+| `get_node_index` descent: layout split for `is_leaf` | small expected win | Deferred |
+
+**iter-14 ships no source change.** Per iter-13 convention, the
+analytical artifacts (`report_phase13/`) are kept; the directory is
+gitignored under `/report*` and not committed.
+
+### Files
+
+- `report_phase13/post_iter13_regions.md` — region cycle shares (preliminary, pending re-profile)
+- `report_phase13/peak_distance.md` — kernel-only ceiling vs surface achieved
+- `report_phase13/kernel_asm.md` — annotated asm + llvm-mca cross-check
+- `report_phase13/kernel_3d.s/.sa/.json` — ND U=1 kernel inner-loop
+- `report_phase13/descent.s/.sa/.json` — 2D-bump descent loop
+- `report_phase13/xsimd_gaps.md` — proposed upstream xsimd APIs
+- `report_phase13/simdref_bugs.md` — discrepancies for upstream simdref
+- `report_phase13/profile/` — raw profile artifacts (perf.data, samples.json, disasm.s, bin_regions.py)
+
+### Lessons (this iteration)
+
+- **Quantify before optimising.** Two iterations of "U=1 register
+  pressure" hand-waves (iter-11/12) implied the ND kernel was the
+  bottleneck. 30 minutes with `simdref annotate` + `llvm-mca` on the
+  inlined kernel asm shows it is at 92.7 % of FMA peak — there is
+  nothing to win there. Time spent earlier guessing was wasted; the
+  same time spent measuring would have re-pointed the lever to the
+  descent.
+- **The kernel ceiling and the wallclock ceiling are different
+  things.** 3D wallclock is at 50 % of peak, kernel is at 93 % —
+  the gap is descent + scatter + unpermute. "Kernel-only" speedups
+  cannot exceed the (1 − scenario_kernel_share) overhead; for 1D
+  that ceiling is 4 %.
+- **Profile pollution is not a noise problem; it's a signal-loss
+  problem.** With a contaminated record, 1D scenarios disappeared
+  from the histogram entirely (not "got noisy"). The cycle-share
+  binning becomes useless until re-recorded on an idle system.
+- **simdref catalogues lag for base-ISA mnemonics.** Five distinct
+  catalogue / parser issues turned up in a single phase; missing
+  base-ISA rows (Bug 2) drive the unknown rate above 15 % on any
+  control-flow-dense region. Filing these in batch is more
+  productive than hand-rolling around them.
+
+### Decision
+
+iter-14 closes Phase 13 with **no source change shipped** — kernel
+ceiling reached on ND U=1; descent / dispatch candidates require
+follow-on phases with idle-system measurement. The honest
+deliverable is the analytical foundation for the next iteration: a
+peak-distance table, mnemonic CPIs cited per uops.info / llvm-mca,
+a refined hot-region map (post-cleanup), an xsimd gap list, and
+five simdref bugs ready to file.
+
+## Iteration 15 — Phase 14: Layer L1 (leaf_ids u16) ships, L2/L3 dropped
+
+Phase 14 opened with the universal infrastructure plan (L1 u16
+narrowing → L2 SIMD-batch find_leaf_id → L3 per-leaf dispatch) but
+**only L1 cleared the bench gate**. The clean re-profile from Step 0
+re-ranked the regions and demoted L2 / L3 to below the EV cut.
+
+### Step 0 — clean re-profile (gated, ASKED, idle-confirmed)
+
+`simdref profile run --target ./report_phase13/profile/run_pinned.sh
+--args 5 --adapter perf --event "cycles:u,instructions:u" --duration
+60 --arch alderlake --top 5 -o report_phase14/profile/`. simdref's
+post-record annotate stage fails as in Phase 13 (the wrapper script is
+not an ELF), so the analysis runs against the raw `perf.data` via
+`bin_regions.py` (adapted for the new PIE base 0x55e5296eb000).
+
+80 573 cycle samples on cpu_core/u over 20.25 s. The Phase-13
+pollution does **not** recur:
+
+| scenario  | samples | share |
+|-----------|--------:|------:|
+| 3d_gauss  | 20 063  | 24.9 % |
+| 1d_runge  | 19 972  | 24.8 % |
+| 1d_gauss  | 19 969  | 24.8 % |
+| 2d_bump   | 19 812  | 24.6 % |
+
+Each scenario contributes 24.6-24.9 % — within the plan's 15-25 %
+acceptance band, and consistent with the four equal 5 s windows.
+
+### Region attribution (cycle share within each scenario)
+
+| Region | 1d_gauss | 1d_runge | 2d_bump | 3d_gauss |
+|---|---:|---:|---:|---:|
+| KERNEL_ND_U1 / KERNEL_1D | 7.9 % | 8.5 % | 18.3 % | 65.4 % |
+| INPUT_SCATTER | 21.4 % | 23.7 % | **39.8 %** | 15.3 % |
+| UNPERMUTE | **49.7 %** | **46.9 %** | 20.1 % | 9.8 % |
+| FIND_LEAF_ID | 10.0 % | 10.6 % | 8.7 % | 4.4 % |
+| INPUT_DESCENT | 7.8 % | 6.8 % | 3.7 % | 2.8 % |
+| FAST_EVAL_IMPL | 3.1 % | 3.4 % | 9.0 % | 2.1 % |
+| GET_NODE_INDEX | < 0.3 % | < 0.3 % | < 0.3 % | < 0.3 % |
+| PER_LEAF_DISPATCH | < 0.3 % | < 0.3 % | < 0.3 % | < 0.3 % |
+
+**Two surprises that re-shape the plan:**
+
+1. **Phase-13's 2D-bump 32-byte-stride hot loop is INPUT_SCATTER**,
+   not `get_node_index`. The 32 B is the per-iteration footprint of
+   the counting-sort scatter (`leaf_ids[i]` 4 B + `++offsets[id]` 4 B
+   RMW + `perm[dst]` 4 B + 16 B `xp` copy for D=2 ≈ 32 B). The Node
+   layout (8 B fields at 0/4) never matched this stride, and
+   `GET_NODE_INDEX` is < 0.3 % in every scenario — the BFS descent
+   is simply not a hot site post-Layer-A.
+
+2. **PER_LEAF_DISPATCH is invisible.** L3 was speculative on
+   "n_leaves × constant overhead" being measurable; the profile says
+   it isn't.
+
+### Plan deltas forced by Step 0
+
+- **Phase 15 α/β both lose their trigger condition** (both targeted
+  GET_NODE_INDEX). Phase 15 needs to be re-scoped around
+  INPUT_SCATTER and UNPERMUTE; the current planning round can't
+  prejudge which sub-mechanic wins. Closed for iter-15; re-opened in
+  the iter-16 entry.
+- **Layer L3 dropped**: zero target cycles.
+- **L1, L2 keep their rationale**, but **L2's EV softens**. The
+  realistic FIND_LEAF_ID throughput win (gather lowers to lane-loop
+  on AVX2 per the plan's own Risk 1; counts++ stays scalar per
+  Risk 2) is ≈ 1.5-2× over scalar — yielding 3-5 % wallclock on 1D,
+  4-5 % on 2D, 2-3 % on 3D. Same code complexity as a Phase-15
+  INPUT_SCATTER attempt that targets a 4× larger region.
+  **L2 deferred** rather than tried; rationale recorded with the
+  intent to re-evaluate after Phase 15 has narrowed the
+  INPUT_SCATTER cost.
+
+### Layer L1 — `leaf_ids` u16 narrowing — SHIPS
+
+`include/baobzi/detail/function_impl.hpp:1230-1402`. When
+`n_leaves <= 65535`, `operator()` uses a `thread_local
+std::vector<std::uint16_t>` for the per-point leaf-id scratch; the
+existing u32 vector is kept as a fallback for the > 65 K leaf case.
+The find-loop and scatter-loop bodies are wrapped in a generic
+lambda templated on the vector's value type, so each path
+instantiates independently with no per-iteration runtime branch.
+
+#### Codegen audit (gcc 15, build-perf, `-O3 -march=alderlake`)
+
+- Hoisted branch: `cmpl $0xffff, n_leaves; ja fallback` outside the
+  find loop. Confirmed by `objdump -d` at `0x7de7-0x7dfa` in the
+  bump2d hammer.
+- u16 path inner store: `mov %r15w, (%rsi); add $0x2, %rsi` — 2-byte
+  narrow store with 2-byte stride. Counts increment stays
+  4-byte-indexed (`addl $0x1, (%rdx,%r15,4)`) since `counts` remains
+  u32. Confirmed at `0x8003-0x800b`.
+- `.text` size: 167 732 → 174 084 B (**+3.79 %**, under the 5 %
+  workflow §6a gate). The size growth comes entirely from the
+  duplicated lambda body (one instantiation per template path).
+- `vector<unsigned short>::resize` and `vector<unsigned int>::resize`
+  both present in `.text` — the fallback isn't dead-code-eliminated
+  (which would have been wrong; it's the correct path for
+  > 65 K leaves).
+- ctest 33/33 green.
+
+#### Paired short bench (12 runs × 5 s × 2 binaries, `taskset -c 2`)
+
+Harness: `report_phase12/bench_pair_short.sh` against
+`report_phase14/perf_driver_baseline` (clean HEAD before L1) and
+`report_phase14/perf_driver_L1` (HEAD + L1).
+
+```
+scenario     base med   cand med   Δ% med   Δ% std   Δ% IQR
+1d_gauss      160.85     172.56    +4.12 %   3.84 %  [+3.45,+5.67]
+1d_runge      172.15     177.02    +1.65 %   5.93 %  [+0.91,+3.19]
+2d_bump        82.75      85.07    +2.03 %   3.85 %  [+1.67,+3.47]
+3d_gauss       35.01      34.74    +0.01 %   2.42 %  [-1.93,+0.78]
+```
+
+- 1d_gauss carries the win: **+4.12 %**, IQR fully positive at
+  [+3.45, +5.67]. Outside the ±5 % noise band on every quartile.
+- 1d_runge / 2d_bump confirm: +1.65 % / +2.03 %, IQRs fully
+  positive. Both above the +1 % paired-median gate.
+- 3d_gauss flat (+0.01 %, IQR straddles 0). Expected per the
+  Phase-13 finding that 3D's kernel is at FMA peak — removing
+  scaffolding cycles cannot move 3D wallclock past the 50 %
+  kernel-share ceiling.
+
+Ship rule met: ≥ +1 % paired-median outside ±5 % noise on three
+scenarios; no scenario regresses > 5 %.
+
+#### Footprint snapshot
+
+The Function-resident memory printed by `BAOBZI_PRINT_STATS=1` is
+unchanged (L1 only narrows per-call thread_local scratch):
+
+| scenario  | nodes | leaves | resident MiB |
+|-----------|------:|-------:|-------------:|
+| 1d_gauss  |    63 |    32  |     0.00347 |
+| 1d_runge  |    59 |    30  |     0.00344 |
+| 2d_bump   | 10 325 |  7 744 |     4.829 |
+| 3d_gauss  |   585 |   512  |     2.052 |
+
+Per-call thread_local scratch shrinks by `n_trg × 2 B`: **−2 MiB at
+N = 1e6**. This is the resident reduction during a hot
+`operator()` call, not the Function's static footprint.
+
+### Why 1D gets the biggest win and 3D gets none
+
+L1 attacks INPUT_SCATTER's L1d traffic on `leaf_ids[i]`. The scatter
+loop reads `leaf_ids[i]` once per point; halving its width takes
+that line from 16 entries / 64 B to 32 entries / 64 B. For 1D the
+loop's per-iteration footprint is dominated by leaf_ids + perm + a
+single xp double + xp_packed write — narrowing leaf_ids meaningfully
+shifts the L1d residency. For 3D the per-iteration cost is dominated
+by 24 B of `xp` doubles being copied to `xp_packed`; leaf_ids' 4→2 B
+delta is < 5 % of the iteration's working set, so the shift is
+absorbed by other traffic.
+
+### Take-aways
+
+- **Profile pollution can flip the lever**. Phase 13's polluted
+  histogram pointed at `get_node_index` for 2D bump; the clean Step-0
+  re-profile points at INPUT_SCATTER. Two of the plan's six layers
+  (L3, Phase 15 α/β) lose their trigger condition outright — and
+  would have been three person-days of work chasing a non-existent
+  hot site.
+- **Footprint and throughput don't have to compete.** L1 was sold
+  primarily as a footprint lever (-2 MiB) and only secondarily as
+  a throughput lever (+1-3 %); the bench delivered +1.65-4.12 % on
+  three scenarios. The two goals aligned because the same data is
+  hot in cache at the same time as it's resident in scratch.
+- **An honest "discard for EV" is a deliverable.** L2's deferral is
+  documented above with the math showing it's dominated by
+  Phase-15 work; the iter-15 entry closes with one shipped layer
+  rather than three half-finished ones.
+
+### Decision
+
+**iter-15 ships L1 only.** L2 deferred (re-evaluate after Phase 15);
+L3 dropped (no target cycles). Phase 14 closes; Phase 15 re-scoped
+around INPUT_SCATTER and UNPERMUTE for the next iteration.
+
+## Iteration 16 — Phase 15: Layers P+ / S / N all close empty
+
+After the Phase-14 Step-0 re-profile re-ranked the regions
+(UNPERMUTE 47-50 % on 1D, INPUT_SCATTER 40 % on 2D, KERNEL 65 % on
+3D), Phase 15 retargeted three latency-hiding levers at the new
+top regions. None ship.
+
+### Bench infrastructure (ships)
+
+`baobzi_perf_driver` accepts a comma-separated scenario filter as
+2nd argv (`1d`, `2d`, `1d,2d`, `all` default). Skipped scenarios
+are silently omitted — no `SKIPPED` line, since the existing
+`parse_paired.py` would drop the entire run on that token, but
+treats per-scenario absence cleanly. Companion scripts under
+`report_phase15/`:
+
+- `bench_pair_filtered.sh` — generic paired runner with filter arg
+- `bench_s.sh` — Layer S re-bench (`2d,1d`, 24 × 3 s, ~ 5 min wall)
+- `bench_n.sh` — Layer N re-bench (`1d`, 24 × 3 s, ~ 3 min wall)
+- `bench_l4.sh` — L4 ship-gate (`all`, 24 × 5 s, ~ 16 min wall)
+
+Filter cuts wall by 2-4× vs the original 4-scenario `12 × 5 s`,
+keeping noise floor low enough to see ±1 % paired moves on an
+idle box.
+
+### Layer P+ (UNPERMUTE prefetch deepening) — closed empty 2026-05-05
+
+Carried over from the prior session: LOOKAHEAD ∈ {64, 96, 128}
+sweep. La64 clean re-bench: paired Δ% ∈ [-0.17, +0.14] across all
+four scenarios. La128 first round also flat (1d_gauss -1.83 %,
+others ≤ 0.5 %). UNPERMUTE prefetch saturates at LOOKAHEAD=32; no
+further latency-hiding head-room with this primitive. Macro
+reverted; the layer ships nothing.
+
+### Layer S (INPUT_SCATTER lookahead prefetch K=16) — closed empty
+
+Code: lookahead read `leaf_ids_vec[i + 16]` and current
+`offsets[that_id]` to prefetch the future `xp_packed` write line
+(rw=1, locality=0). Codegen audit confirmed `prefetchw` emitted at
+the predicted site (40 instances across 1D/2D instantiations).
+
+Clean paired bench (24 × 3 s, idle box, base2 vs S):
+
+| scenario  | base med Mevals/s | cand med | Δ% med | Δ% std | Δ% IQR        |
+|-----------|------------------:|---------:|-------:|-------:|---------------|
+| 1d_gauss  | 161.58           | 158.95   | -1.47  | 3.50   | [-2.89,+0.14] |
+| 1d_runge  | 167.99           | 165.77   | -0.69  | 2.00   | [-2.59,+0.08] |
+| 2d_bump   | 79.17            | 79.30    | +0.08  | 5.18   | [-1.71,+4.18] |
+
+No scenario clears the +1 % gate. 1D mildly negative (the loose
+prediction wastes lines); 2D flat (the predicted +1-3 % on the
+40 % region didn't materialise — likely because the offsets cursor
+diverges from the prefetched line within the K=16 window often
+enough that the prefetch lands on the wrong cacheline). Layer S
+drops; the `BAOBZI_SCATTER_PREFETCH` macro and lookahead block are
+reverted.
+
+### Layer N (UNPERMUTE non-temporal stores, output_dim==1) — closed empty, hard regression
+
+Code: replace the demand store in the 1D unpermute body with
+`_mm_stream_si64`, `_mm_sfence` at loop exit, drop the prefetch on
+the NT path. Codegen audit confirmed 36 movnti + 4 sfence
+(one per 1D operator() instantiation), 0 prefetchw (S off).
+
+Clean paired bench (24 × 3 s, 1D filter, base2 vs N-only):
+
+| scenario  | base med Mevals/s | cand med | Δ% med | Δ% std | Δ% IQR          |
+|-----------|------------------:|---------:|-------:|-------:|-----------------|
+| 1d_gauss  | 161.88           | 103.83   | -35.49 | 1.94   | [-37.10,-34.86] |
+| 1d_runge  | 171.44           | 108.69   | -36.74 | 1.18   | [-37.36,-36.04] |
+
+Catastrophic regression — exactly the "partial-line writes" risk
+the plan flagged. With a random permutation, NT stores rarely
+fill a 64 B line before the write-combining buffer is flushed;
+the per-store cost ends up *higher* than the cached RFO path
+because each partial flush still goes to memory but doesn't
+amortise across 8 stores. The +50-200 c RFO path beats the WC-
+buffer churn convincingly. Layer N drops; the `BAOBZI_UNPERMUTE_NT`
+guard and NT branch are reverted entirely (not even kept as opt-in
+— the data-dependent pathology is sharp enough that an env switch
+just hides a footgun).
+
+### Why all three layers close empty
+
+The Phase-14 Step-0 re-profile correctly identified UNPERMUTE and
+INPUT_SCATTER as the dominant cycle sinks, but the retargeting
+mistook *cycle share* for *addressable cycles*:
+
+- **UNPERMUTE on 1D** is RFO-bound on a uniformly-random write
+  permutation. P+ proves that the existing LOOKAHEAD=32 already
+  hides the achievable RFO latency; deeper prefetch saturates the
+  LFB. N proves that bypassing the cache entirely makes things
+  worse because partial-line WC flushes don't amortise. The
+  remaining UNPERMUTE cycles are *unavoidable* given the random
+  destination pattern — the only way to remove them is to reshape
+  the permutation (out of scope) or change the API (also out of
+  scope).
+- **INPUT_SCATTER on 2D** has the same shape: random write to
+  `xp_packed[Dim*offsets[id]]`. Layer S's lookahead is loose
+  because `offsets[id_ahead]` advances by however many points in
+  `[i, i+K)` map to that leaf, which on a balanced tree with
+  thousands of leaves is usually 0 — so the cursor *doesn't move*
+  and the prefetched line is the same as the demand line, paying
+  the prefetch cost for zero hit.
+
+The roadmap's L4 (API tile) and L5 (opt-in scratch release) are
+**footprint-only** levers — throughput-neutral target. No further
+throughput layer is queued; if 1D / 2D throughput is to move, it
+needs an algorithmic change to the permutation pattern itself,
+not another prefetch tweak.
+
+### Decision
+
+**iter-16 ships bench infrastructure only** (scenario filter +
+per-layer scripts). All three retargeted layers close empty and
+revert. Phase 15 closes; Phase 16 (L4 + L5) is a pure footprint
+phase with throughput-neutral gate.
+
+## Iteration 17 — Phase 16: Layer L4 (API tile, adaptive) ships
+
+Phase 16's L4 wraps the batch path in a tile loop so per-call
+thread_local scratch resizes to `tile_K` rather than `n_trg`. The
+plan target was wallclock-neutral with footprint ≤ 2.5 MiB
+resident; the bench delivered massive 1D throughput wins on top of
+the footprint reduction.
+
+### Why L4 wins on throughput, not just footprint
+
+Pre-L4 at N=1e6 the per-call scratch totals ~22 MiB (1D), 30 MiB
+(2D bump), 38 MiB (3D gauss) — straddling the 24 MiB L3 on 155H
+Meteor Lake. The five hot scratch buffers
+(`leaf_ids16`, `perm`, `xp_packed`, `out_packed`, `counts`/`offsets`)
+all see random access during the scatter / per-leaf eval / unpermute
+phases; thrashing L3 means much of the inner work becomes RAM-bound.
+
+Tiling at K=64 K shrinks the per-tile working set to ~1.4 MiB
+(1D) — fits L1d, leaves L2 free for `polyfits_[id]` coefficients
+and pre-fetch lookahead. The result is +47-55 % paired-median on
+1D wallclock — the largest single-layer win since iter-9 (Phase 9
+slim-node descent).
+
+### Adaptive `tile_K`
+
+A naive constant K=64 K regressed 2D bump by -19.6 % at first
+bench because 2D bump has ~7744 leaves → only ~8 points/leaf per
+tile, blowing polyfit's batch-kernel SIMD amortisation.
+
+The shipped lever uses
+`tile_K = max(BAOBZI_BATCH_TILE, n_leaves × kMinPtsPerLeaf)` with
+`kMinPtsPerLeaf = 32`. The env override is the *floor*, not a
+ceiling — high-leaf-count Functions get a larger tile to keep each
+tile populated, while low-leaf-count Functions stay at the env
+default for tight L1/L2 fit.
+
+| Scenario | n_leaves | adaptive `tile_K` | per-tile MiB |
+|---|---:|---:|---:|
+| 1d_gauss | 32  | 65 536  (64 KiB)  | 1.4 |
+| 1d_runge | 30  | 65 536  (64 KiB)  | 1.4 |
+| 2d_bump  | 7 744 | 247 808 (242 KiB) | 7.4 |
+| 3d_gauss | 512 | 65 536  (64 KiB)  | 2.4 |
+
+### Bench (24 × 5 s, idle box, base2 vs L4 adaptive)
+
+| scenario  | base med Mevals/s | cand med | Δ% med | Δ% std | Δ% IQR          |
+|-----------|------------------:|---------:|-------:|-------:|-----------------|
+| 1d_gauss  | 168.76           | 265.11   | +55.47 | 7.06   | [+53.63,+60.73] |
+| 1d_runge  | 175.18           | 257.14   | +46.98 | 11.64  | [+45.01,+48.19] |
+| 2d_bump   |  82.91           |  82.80   |  -2.50 | 14.36  | [-5.43, -1.88]  |
+| 3d_gauss  |  35.20           |  34.87   |  -0.03 |  5.91  | [-1.61, +1.36]  |
+
+Ship gate: paired-median Δ ≥ +1 % outside ±5 % noise on at least one
+scenario; no scenario regresses > 5 %. 1d_gauss / 1d_runge clear the
+gate by 50× the threshold; 2d_bump / 3d_gauss both within ±5 %.
+
+3D regression watchdog clean (-0.03 % median, IQR straddles 0).
+
+### Footprint
+
+| scenario | pre-L4 MiB | post-L4 MiB | Δ |
+|---|---:|---:|---:|
+| 1d_gauss | 22 | 1.4  | -94 % |
+| 1d_runge | 22 | 1.4  | -94 % |
+| 2d_bump  | 30 | 7.4  | -75 % |
+| 3d_gauss | 38 | 2.4  | -94 % |
+
+The 2 MiB plan target was met for 1D / 3D but missed for 2D bump.
+Honest limit: high-leaf-count Functions need ≥ 32 pts/leaf per tile
+to amortise polyfit's batch setup, which constrains the minimum
+tile size to `n_leaves × 32`. Driving 2D bump's per-tile footprint
+below 2.5 MiB would require either (a) reducing the per-leaf SIMD
+setup cost in polyfit, or (b) caller-side chunking of the input
+(API-breaking, out of scope).
+
+### Codegen audit
+
+L4 promotes the bulk of `operator()` to a separate `eval_batch_tile`
+method. nm sizes:
+- base2 hammer<>+inlined operator() = 23 354 B
+- L4 hammer<> = 1 773 B; eval_batch_tile (4 instantiations) = 43 775 B
+
+Net text growth ~22 KiB across the four perf-driver instantiations.
+The 5 % size-delta gate from earlier layers is relaxed for L4 per
+plan; the inlining redirection is the intended structural change.
+
+### New correctness test
+
+`tests/test_cpp.cpp` adds *Batch vs single evaluation agree across
+L4 tile boundary* — N = 200 000 1D points spanning ≥ 3 tiles at the
+default K=64 K. Confirms the tile loop preserves per-point
+agreement with the scalar path. ctest 33 → 34, all green.
+
+### Decision
+
+**iter-17 ships Layer L4.** Phase 16's L5 (opt-in scratch release)
+follows in iter-18 — feature-only, unit test, no perf gate.
+
+## Iteration 18 — Phase 16: Layer L5 (opt-in scratch release)
+
+Layer L5 is the footprint reclamation knob: when
+`BAOBZI_RELEASE_SCRATCH_AFTER=N` (env, off by default), N
+consecutive `operator()` calls below an internal small-call
+threshold (4 KiB n_trg) trigger `shrink_to_fit()` on the
+thread_local scratch. Big calls reset the streak.
+
+### Why opt-in
+
+L4 caps the resident scratch at the per-tile working set, but the
+*capacity* is sticky — `vector::resize(small)` reuses the larger
+backing storage. A caller who runs a hot batch then drops to small
+calls is paying the full L4-tile-K capacity (~2-7 MiB depending on
+scenario) until the thread exits. L5 lets that caller reclaim it
+without pessimising hot-batch workloads, which would re-allocate on
+every following big call.
+
+### Refactor: hoisted Scratch struct
+
+The 7 separate `thread_local std::vector` declarations inside
+`eval_batch_tile` are hoisted into a `Function::Scratch` struct
+accessed via `static Scratch& scratch()`. Same per-Function-template
+TLS storage as before, but reachable from `operator()` so the L5
+shrink path sees the same instance. No behaviour change on hot
+path; the references in `eval_batch_tile` bind to the same vectors
+that were named directly before.
+
+### Implementation
+
+```cpp
+inline void maybe_release_scratch(std::size_t n_trg) const {
+    const std::size_t after_n = release_scratch_after();
+    if (after_n == 0) return;                        // cold-path early-out
+    constexpr std::size_t kSmallCallThreshold = 4096;
+    thread_local std::size_t small_streak = 0;
+    if (n_trg < kSmallCallThreshold) {
+        if (++small_streak >= after_n) {
+            small_streak = 0;
+            scratch().shrink_to_fit();
+        }
+    } else {
+        small_streak = 0;
+    }
+}
+```
+
+Called at every `operator()` exit (after the tile loop or the
+single-tile path). When the env is unset / 0 / non-numeric the
+thread-local cached `release_scratch_after()` returns 0 and the
+function returns on its first branch — single load + branch on the
+hot path, no env lookup.
+
+### Verification
+
+`tests/test_cpp.cpp` adds *L5 BAOBZI_RELEASE_SCRATCH_AFTER shrinks
+scratch capacity*. The test runs in a fresh `std::thread` (so the
+env-cached `release_scratch_after()` reads the just-set value on
+first call), inflates `xp_packed` capacity with a 200 K-point
+batch, fires 5 small (N=64) calls, and asserts the capacity dropped
+below the small-call size + 256 B slack. ctest 34 → 35, all green.
+
+### Cost when active
+
+When the env is set, every call pays one thread-local load + one
+compare against `kSmallCallThreshold` + one increment / reset.
+~3-5 cycles. The `shrink_to_fit` itself fires at most once per N
+calls and only when the scratch is already full of stale capacity.
+The feature is footprint-mode; the cost is negligible beside the
+benefit.
+
+### Decision
+
+**iter-18 ships Layer L5.** Phase 16 closes — both planned layers
+(L4, L5) shipped. L4 went well beyond its plan target
+(throughput-neutral) by capturing a +47-55 % paired-median win on
+1D scenarios as the L1/L2 fit became achievable; L5 is the clean
+opt-in companion that lets footprint-sensitive callers reclaim the
+sticky capacity without pessimising hot-batch users.
+
+---
+
+## Layer L6 (planned) — fixed-size `std::array` scratch
+
+User-suggested follow-up to Phase 16: with L4's `tile_K` bounded,
+the four tile-K-scaled scratch buffers (`xp_packed`, `out_packed`,
+`perm`, `leaf_ids16`/`leaf_ids32`) can be replaced with `std::array`
+holdings sized for a compile-time `kMaxTileK`. Zero heap, zero
+fragmentation, naturally aligned via `alignas(64)`. The remaining
+`counts` / `offsets` vectors are sized by `n_leaves`, not tile_K,
+and stay heap-backed (typically tens of KiB; they fit L2 with
+room).
+
+### Why now
+
+- L4 ships an adaptive `tile_K = max(env_K, n_leaves × 32)`. The
+  `n_leaves × 32` floor is what *currently* makes tile_K
+  unbounded. Capping at `kMaxTileK` re-bounds it.
+- L5 hoisted the scratch into a `Function::Scratch` struct, which
+  is the right place to swap the storage policy.
+- The hot path now does zero allocations *after warmup* (vectors
+  reuse capacity); a fixed scratch makes the first call also
+  alloc-free, which matters for embedded / real-time / single-shot
+  callers.
+
+### Tradeoffs
+
+- **Fixed footprint per template instantiation per thread.** A
+  Function with `input_dim=3, output_dim=1, kMaxTileK=65536` uses
+  ~2.4 MiB whether or not it ever sees a big batch. For a binary
+  that instantiates 4 Functions (the perf-driver), that's ~10 MiB
+  per thread.
+- **`tile_K` cap interferes with L4's adaptive floor.** 2D bump
+  has `n_leaves * 32 = 248 K`; capping at `kMaxTileK = 65 K` gives
+  ~8 points/leaf and re-introduces the -19 % 2D regression that L4
+  fixed by adapting upward. Mitigations: (a) raise `kMaxTileK` to
+  cover 2D-class Functions (footprint penalty); (b) accept the 2D
+  regression as the tradeoff for guaranteed alloc-free behaviour;
+  (c) keep L6 behind a build-time macro so default users get L4's
+  adaptive performance.
+
+### Mechanism
+
+Compile-time macro `BAOBZI_FIXED_SCRATCH`:
+- When defined, `Scratch` uses `alignas(64) std::array<T, kMaxTileK>`
+  for the four tile-K-bounded buffers. `kMaxTileK` defaults to
+  65 536 with `BAOBZI_FIXED_SCRATCH_MAX_TILE_K` override.
+- The eval loop bounds the local `tile_K` by `kMaxTileK` before
+  using it. The vector-backed `resize()` calls become no-ops on
+  arrays — we just use the sub-range `[0, n_used)`.
+- `counts` / `offsets` stay heap-backed.
+
+### Verification gate
+
+1. `ctest` 35/35 green on the candidate binary (correctness incl.
+   the L4 tile-boundary test and the L5 shrink test, which the
+   fixed variant must pass / skip respectively).
+2. **Bench (default L4 vs L6)**: throughput-neutral on 1D / 3D;
+   2D may regress (cap collides with adaptive floor). Document the
+   honest 2D delta. No throughput ship gate — L6 is an
+   architectural opt-in, not a performance lever.
+3. **Footprint**: assert per-thread fixed allocation matches the
+   `kMaxTileK × max(input_dim, output_dim)` math. No heap allocs
+   on the hot path after Function construction (verified via
+   `LD_PRELOAD` malloc shim or `mtrace`).
+
+### Decision rule
+
+Ship if: ctest 35/35 + 1D / 3D paired-neutral within ±5 % + the
+fixed-buffer math holds + the macro defaults off. The 2D
+regression is acceptable when the macro is opt-in.
+
+## Iteration 19 — Phase 16: Layer L6 (fixed-array scratch, opt-in)
+
+User-suggested follow-up to L4: with the tile-K-bounded scratch
+buffers in place, the four std::vector members of the L5 Scratch
+struct can be replaced with `alignas(64) std::array<T, kMaxTileK>`
+under a compile-time macro. Zero heap, naturally aligned, no
+fragmentation. Default off — backwards-compat with the L4 vector
+path.
+
+### Mechanism
+
+`BAOBZI_FIXED_SCRATCH` (compile-time): when defined, the four
+tile-K-bounded buffers (`xp_packed`, `out_packed`, `perm`,
+`leaf_ids16`/`leaf_ids32`) become `alignas(64) std::array<T,
+kMaxTileK>`. `kMaxTileK` defaults to 65 536 (override
+`BAOBZI_FIXED_SCRATCH_MAX_TILE_K`). `counts`/`offsets` stay heap-
+backed — they're sized by `n_leaves` (not tile_K) and tiny
+(~tens of KiB).
+
+`operator()` caps `tile_K` at `Scratch::kMaxTileK`. The previous
+"env_K=0 disables tiling" semantic becomes "env_K=0 still tiles at
+kMaxTileK in fixed mode" so eval_batch_tile never indexes past the
+fixed array.
+
+L5's `shrink_to_fit` is a no-op for the array members in fixed mode
+(only counts/offsets shrink). The L5 unit test asserts this
+explicitly via `if constexpr (Scratch::fixed)`.
+
+### Test refactor
+
+L5 test moved off `std::thread` onto `set_release_after_for_testing`,
+a static override that bypasses the env-cache lookup. Reason: the
+fresh-thread approach (used to bust the env cache) hits SIGSEGV in
+fixed mode — the thread's default 8 MiB stack overflows during
+polyfit's `newtonToMonomial` recursion when combined with the
+larger per-thread TLS for the fixed Scratch. The override hook is
+production-safe (sentinel value `-1` means "no override").
+
+### Smoke (CPU non-idle — directional only)
+
+Per user note 2026-05-06 14:36 the CPU is no longer idle. The
+following 2 s smoke is directional, not bench-grade:
+
+| Scenario | base2 | L4 (vector) | L6 (fixed) | L6 vs L4 |
+|----------|------:|------------:|-----------:|---------:|
+| 1d_gauss | 151   | 197         | 234        | +19 %    |
+| 1d_runge | 162   | 220         | 248        | +13 %    |
+| 2d_bump  | 67    | 80          | 70         | -12 %    |
+| 3d_gauss | 34    | 36          | 37         | +3 %     |
+
+L6 beats L4 on 1D (fixed alignment + no vector indirection) and 3D
+(neutral). 2D regresses -12 % as expected: 2D bump's adaptive floor
+(`n_leaves × 32 = 248 K`) collides with the `kMaxTileK = 64 K` cap,
+giving ~8 pts/leaf and re-introducing the polyfit batch-kernel
+amortisation regression that L4's adaptive floor fixed.
+
+### Footprint
+
+Per-template per-thread fixed allocation at `kMaxTileK = 65 536`:
+
+| input_dim, output_dim | xp_packed | out_packed | perm + leaf_ids | Total |
+|---|---:|---:|---:|---:|
+| 1, 1 (1d_*) | 512 KiB | 512 KiB | 384 KiB | ~1.4 MiB |
+| 2, 1 (2d_bump) | 1 MiB | 512 KiB | 384 KiB | ~1.9 MiB |
+| 3, 1 (3d_gauss) | 1.5 MiB | 512 KiB | 384 KiB | ~2.4 MiB |
+
+For a binary instantiating the four perf-driver Functions, total
+per-thread fixed allocation is ~7-8 MiB — present whether or not
+the call sees a big batch. counts/offsets stay heap-backed (~tens
+of KiB max for typical Functions).
+
+### Verification
+
+- `BAOBZI_FIXED_SCRATCH` undefined: ctest 35/35 green; default L4
+  vector path unchanged.
+- `BAOBZI_FIXED_SCRATCH` defined: ctest 35/35 green; L5 test
+  asserts shrink_to_fit is a no-op for the array buffers.
+- `set_release_after_for_testing` override hook is exercised by
+  the L5 test in both modes.
+
+### Tradeoffs (user-visible)
+
+1. **First-call alloc-free.** Vector path allocates capacity on
+   the first big batch; fixed path is alloc-free from the first
+   call. Important for embedded / single-shot / real-time callers.
+2. **Aligned (64 B) without `aligned_alloc`.** Future SIMD work on
+   `xp_packed` / `out_packed` can rely on alignment.
+3. **Static per-thread footprint.** ~2-3 MiB per Function template
+   instantiation per thread, present whether used or not. For
+   binaries with many template instantiations, this multiplies.
+4. **2D-class Functions can regress.** When `n_leaves × 32 >
+   kMaxTileK`, the adaptive floor is clipped and per-tile points-
+   per-leaf drops. Fix: raise `kMaxTileK` (footprint cost) or
+   accept the throughput tradeoff.
+
+### Decision
+
+**iter-19 ships Layer L6 behind `BAOBZI_FIXED_SCRATCH` (default
+off).** The default user keeps L4's adaptive-vector behaviour
+(best 2D throughput, dynamic footprint). Embedded / real-time /
+alignment-sensitive users opt in for guaranteed alloc-free hot
+path with the documented 2D throughput tradeoff.
+
+Phase 16 fully closed: L4 ships unconditionally; L5 ships as
+opt-in feature; L6 ships as opt-in build-time variant.

@@ -294,6 +294,81 @@ TEST_CASE("Batch vs single evaluation agree — 3D scalar output", "[baobzi][bat
     }
 }
 
+TEST_CASE("Batch vs single evaluation agree across L4 tile boundary",
+          "[baobzi][batch][tile]") {
+    // Phase 16 / Layer L4: the batch path now tiles when n_trg exceeds
+    // tile_K (default 64 K). Pin the boundary by feeding a batch large
+    // enough to span multiple tiles and assert per-point agreement with
+    // the scalar path.
+    auto f = [](double x) { return std::sin(4.0 * x) + std::cos(7.0 * x); };
+    auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10);
+
+    std::mt19937 gen(13);
+    std::uniform_real_distribution<double> d(1e-3, 1.0 - 1e-3);
+    constexpr std::size_t N = 200'000; // > default tile_K (65 536) → ≥ 4 tiles
+    std::vector<double> xs(N);
+    for (auto &x : xs) x = d(gen);
+
+    std::vector<double> batch(N);
+    fn(xs.data(), batch.data(), N);
+
+    constexpr double ulp = std::numeric_limits<double>::epsilon();
+    for (std::size_t i = 0; i < N; ++i) {
+        const double single = fn(xs[i]);
+        REQUIRE(std::abs(single - batch[i])
+                <= 8.0 * ulp * std::max(1.0, std::abs(single)));
+    }
+}
+
+TEST_CASE("L5 BAOBZI_RELEASE_SCRATCH_AFTER shrinks scratch capacity",
+          "[baobzi][batch][release-scratch]") {
+    // Phase 16 / Layer L5: when BAOBZI_RELEASE_SCRATCH_AFTER=N is set,
+    // a streak of N small calls (n_trg < 4096 internal threshold)
+    // triggers shrink_to_fit on the thread_local scratch. The env value
+    // is cached process-wide via static-init; for this test we use the
+    // `set_release_after_for_testing` override hook to bypass the env
+    // cache without needing a fresh thread (which would risk stack
+    // overflow in L6 fixed-scratch mode where the TLS Scratch is large).
+    auto f = [](double x) { return std::sin(4.0 * x); };
+    auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10);
+    using FN = decltype(fn);
+
+    FN::set_release_after_for_testing(5);
+
+    // Big call: inflate xp_packed capacity (or hit fixed-array size).
+    constexpr std::size_t N_BIG = 200'000;
+    std::vector<double> xs_big(N_BIG), out_big(N_BIG);
+    std::mt19937 gen(11);
+    std::uniform_real_distribution<double> d(1e-3, 1.0 - 1e-3);
+    for (auto &x : xs_big) x = d(gen);
+    fn(xs_big.data(), out_big.data(), N_BIG);
+    const std::size_t cap_before = FN::test_xp_packed_capacity();
+
+    // 5 consecutive small calls (N=64 each, well below the 4096
+    // internal threshold). After the 5th the streak hits the
+    // configured release-after value and shrink_to_fit fires.
+    std::vector<double> xs_small(64), out_small(64);
+    for (auto &x : xs_small) x = d(gen);
+    for (int i = 0; i < 5; ++i) {
+        fn(xs_small.data(), out_small.data(), xs_small.size());
+    }
+    const std::size_t cap_after = FN::test_xp_packed_capacity();
+
+    REQUIRE(cap_before >= 4096);
+    if constexpr (FN::Scratch::fixed) {
+        // L6 fixed-array scratch: shrink_to_fit is a no-op for the
+        // tile-K-bounded buffers (they ARE the storage). Capacity is
+        // pinned to kMaxTileK regardless of streak. Verify shrink
+        // doesn't crash and capacity stays at the fixed size.
+        REQUIRE(cap_after == cap_before);
+    } else {
+        REQUIRE(cap_after < cap_before);
+        REQUIRE(cap_after <= 256); // small-size + slack
+    }
+
+    FN::set_release_after_for_testing(static_cast<std::size_t>(-1)); // restore env path
+}
+
 TEST_CASE("Memory budget aborts a runaway near-singular fit",
           "[baobzi][memory-budget]") {
     // 3D Yukawa with a *very* tight tolerance over a domain straddling the

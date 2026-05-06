@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -762,9 +763,126 @@ struct PolyTree {
 
             half_width = half_width * value_type{0.5};
         }
+
+        // L9 (Phase 10b): for shallow subtrees, build a quantize-to-leaf
+        // table so eval-time descent collapses to a single load. The
+        // budget is 64 KiB per subtree (table is `uint32_t`, 4 B/entry,
+        // size `1 << (input_dim * max_depth_)`). For our scenarios:
+        //   1D gauss depth 5 → 32 entries (128 B)
+        //   1D runge depth 6 → 64 entries (256 B)
+        //   2D bump  depth 7 → 16 K   (64 KiB) — exactly at budget
+        //   3D gauss depth 3 → 512    (2 KiB)
+        // Builds cost O(2^(Dim*depth)) descents at fit-time; eval-time
+        // saves the per-level (load, compare, branch) chain entirely.
+        constexpr std::size_t kTableMaxEntries = std::size_t{1} << 14; // 64 KiB / 4 B
+        if (max_depth_ > 0) {
+            const std::size_t total_bits = input_dim * max_depth_;
+            if (total_bits <= 14) {
+                const std::size_t n = std::size_t{1} << total_bits;
+                if (n <= kTableMaxEntries) {
+                    leaf_table_.assign(n, std::uint32_t{0});
+                    leaf_table_depth_ = max_depth_;
+                    for (std::size_t d = 0; d < input_dim; ++d) {
+                        const value_type span = upper_[d] - lower_[d];
+                        inv_span_bins_[d] = static_cast<value_type>(
+                            std::size_t{1} << max_depth_) / span;
+                    }
+                    const value_type bins = static_cast<value_type>(
+                        std::size_t{1} << max_depth_);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        // Decode i into per-axis quantize indices q[d].
+                        std::size_t r = i;
+                        const std::size_t bits = max_depth_;
+                        const std::size_t mask = (std::size_t{1} << bits) - 1;
+                        // Compute cell-center x and descend the tree.
+                        if constexpr (input_dim == 1) {
+                            const std::size_t q0 = r & mask;
+                            const value_type span = upper_[0] - lower_[0];
+                            const value_type cell = span / bins;
+                            const value_type xc = lower_[0] +
+                                (static_cast<value_type>(q0) + value_type{0.5}) * cell;
+                            leaf_table_[i] = nodes_[get_node_index(xc)].poly_eval_id;
+                        } else {
+                            input_type xc;
+                            for (std::size_t d = 0; d < input_dim; ++d) {
+                                const std::size_t qd = r & mask;
+                                r >>= bits;
+                                const value_type span = upper_[d] - lower_[d];
+                                const value_type cell = span / bins;
+                                xc[d] = lower_[d] +
+                                    (static_cast<value_type>(qd) + value_type{0.5}) * cell;
+                            }
+                            leaf_table_[i] = nodes_[get_node_index(xc)].poly_eval_id;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     inline const node_t &find_node(const input_type &x) const { return nodes_[get_node_index(x)]; }
+
+    /// Combined leaf-id lookup: table if available, else descent.
+    inline std::uint32_t find_leaf_id(const input_type &x) const {
+        if (!leaf_table_.empty()) {
+            const std::size_t bits = leaf_table_depth_;
+            const std::size_t mask = (std::size_t{1} << bits) - 1;
+            std::size_t idx = 0;
+            if constexpr (input_dim == 1) {
+                std::size_t q0 = static_cast<std::size_t>(
+                    (x - lower_[0]) * inv_span_bins_[0]);
+                if (q0 > mask) q0 = mask;
+                idx = q0;
+            } else {
+                for (std::size_t d = 0; d < input_dim; ++d) {
+                    std::size_t qd = static_cast<std::size_t>(
+                        (x[d] - lower_[d]) * inv_span_bins_[d]);
+                    if (qd > mask) qd = mask;
+                    idx |= qd << (bits * d);
+                }
+            }
+            return leaf_table_[idx];
+        }
+        return nodes_[get_node_index(x)].poly_eval_id;
+    }
+
+    inline bool has_leaf_table() const noexcept { return !leaf_table_.empty(); }
+
+    /// Layer A: leaf-id lookup that returns `ood_id` for points outside this
+    /// subtree's domain. Caller must have verified `has_leaf_table()`.
+    ///
+    /// The signed `vcvttsd2si` + unsigned compare collapses the OOD pre-check
+    /// (`x[d] < lower_left_[d] || x[d] >= upper_right_[d]`) into the same
+    /// quantize that builds the table index: an OOR positive double yields
+    /// INT64_MIN (x86-64 indefinite-integer), which as `uint64_t` is 2^63 —
+    /// far above any reasonable `mask`. Negative inputs likewise produce
+    /// INT64_MIN. One `vcvttsd2si` (lat 5) + one `cmp` per axis replaces the
+    /// 2 `vcomisd` of the original OOD pre-check plus the cast safeguard
+    /// emitted by the unsigned static_cast in `find_leaf_id`.
+    ///
+    /// Single-subtree precondition: this subtree's `lower_` matches the
+    /// owning Function's `lower_left_`. Multi-subtree callers must keep the
+    /// Function-level OOD pre-check + `get_linear_bin` path.
+    inline std::uint32_t find_leaf_id_with_ood(const input_type &x,
+                                               std::uint32_t ood_id) const {
+        const std::size_t bits = leaf_table_depth_;
+        const std::size_t mask = (std::size_t{1} << bits) - 1;
+        std::size_t idx = 0;
+        if constexpr (input_dim == 1) {
+            const std::int64_t q0 = static_cast<std::int64_t>(
+                (x - lower_[0]) * inv_span_bins_[0]);
+            if (static_cast<std::uint64_t>(q0) > mask) return ood_id;
+            idx = static_cast<std::size_t>(q0);
+        } else {
+            for (std::size_t d = 0; d < input_dim; ++d) {
+                const std::int64_t qd = static_cast<std::int64_t>(
+                    (x[d] - lower_[d]) * inv_span_bins_[d]);
+                if (static_cast<std::uint64_t>(qd) > mask) return ood_id;
+                idx |= static_cast<std::size_t>(qd) << (bits * d);
+            }
+        }
+        return leaf_table_[idx];
+    }
 
     /// Descent hot loop. Phase 9 / Layers A+E: the node no longer carries
     /// `center`; instead the per-subtree (lo, hi) bounds are carried in
@@ -828,6 +946,13 @@ struct PolyTree {
     dim_array_t lower_{};
     dim_array_t upper_{};
     std::size_t max_depth_ = 0;
+    // L9: quantize→leaf table for shallow subtrees. Empty when not built.
+    std::vector<std::uint32_t> leaf_table_;
+    std::size_t leaf_table_depth_ = 0;
+    // Precomputed `(1.0 / span) * 2^depth` per axis so the per-point
+    // quantize is a multiply (vmulsd, lat 3) instead of a divide
+    // (vdivsd, lat 14).
+    std::array<value_type, input_dim> inv_span_bins_{};
     std::vector<NonConvergedPanel> non_converged_panels_;
 };
 } // namespace detail
@@ -1092,6 +1217,131 @@ class Function {
 
     inline const node_t &find_node(const input_type &x) const { return subtrees_[get_linear_bin(x)].find_node(x); }
 
+    /// Layer L5 (Phase 16): thread-local scratch buffers for the batch
+    /// path, hoisted into a single struct so `operator()` can both feed
+    /// `eval_batch_tile` and (when L5 is opted-in) shrink_to_fit the
+    /// scratch after a streak of small calls. Per-Function-instantiation
+    /// TLS — different `Function<...>` types do not share scratch, so
+    /// `shrink_to_fit` on one does not stomp on another's hot-batch
+    /// capacity.
+    ///
+    /// Layer L6 (Phase 16, opt-in): when `BAOBZI_FIXED_SCRATCH` is
+    /// defined, the four tile-K-bounded buffers (`xp_packed`,
+    /// `out_packed`, `perm`, `leaf_ids*`) become `alignas(64)
+    /// std::array<T, kMaxTileK>` — zero heap, naturally aligned, no
+    /// fragmentation. `counts`/`offsets` are sized by `n_leaves` (not
+    /// tile_K) and stay heap-backed; they are tiny (~tens of KiB) and
+    /// fit L1d. The compile-time `kMaxTileK` (default 65 536, override
+    /// via `BAOBZI_FIXED_SCRATCH_MAX_TILE_K`) caps the per-template
+    /// per-thread footprint. With `input_dim=3, output_dim=1, kMaxTileK
+    /// = 65 536`: ~2.4 MiB.
+    struct Scratch {
+#ifdef BAOBZI_FIXED_SCRATCH
+#  ifndef BAOBZI_FIXED_SCRATCH_MAX_TILE_K
+#    define BAOBZI_FIXED_SCRATCH_MAX_TILE_K 65536u
+#  endif
+        static constexpr std::size_t kMaxTileK = BAOBZI_FIXED_SCRATCH_MAX_TILE_K;
+        static constexpr bool fixed = true;
+        alignas(64) std::array<std::uint16_t, kMaxTileK>             leaf_ids16{};
+        alignas(64) std::array<std::uint32_t, kMaxTileK>             leaf_ids32{};
+        alignas(64) std::array<std::uint32_t, kMaxTileK>             perm{};
+        alignas(64) std::array<value_type,    input_dim * kMaxTileK> xp_packed{};
+        alignas(64) std::array<value_type,    output_dim * kMaxTileK> out_packed{};
+#else
+        static constexpr std::size_t kMaxTileK = std::numeric_limits<std::size_t>::max();
+        static constexpr bool fixed = false;
+        std::vector<std::uint16_t> leaf_ids16;
+        std::vector<std::uint32_t> leaf_ids32;
+        std::vector<std::uint32_t> perm;
+        std::vector<value_type>    xp_packed;
+        std::vector<value_type>    out_packed;
+#endif
+        std::vector<std::uint32_t> counts;   // sized by n_leaves
+        std::vector<std::uint32_t> offsets;  // sized by n_leaves
+        void shrink_to_fit() {
+            counts.shrink_to_fit();
+            offsets.shrink_to_fit();
+            if constexpr (!fixed) {
+                // Vector path only — std::array storage cannot shrink.
+#ifndef BAOBZI_FIXED_SCRATCH
+                leaf_ids16.shrink_to_fit();
+                leaf_ids32.shrink_to_fit();
+                perm.shrink_to_fit();
+                xp_packed.shrink_to_fit();
+                out_packed.shrink_to_fit();
+#endif
+            }
+        }
+    };
+    static Scratch &scratch() {
+        thread_local Scratch s;
+        return s;
+    }
+
+    /// Layer L5 (Phase 16): consecutive-small-call streak count after
+    /// which `BAOBZI_RELEASE_SCRATCH_AFTER` triggers shrink_to_fit. 0
+    /// (env unset / 0 / non-numeric) disables the feature — the cold
+    /// path. Read once per process via static-init, then optionally
+    /// overridden by a test hook (`set_release_after_for_testing`).
+    /// Hot path is one load + branch on `cached + override`.
+    static std::size_t release_scratch_after() {
+        const std::size_t override_v = release_after_test_override();
+        if (override_v != static_cast<std::size_t>(-1)) return override_v;
+        static const std::size_t cached = []() -> std::size_t {
+            const char *e = std::getenv("BAOBZI_RELEASE_SCRATCH_AFTER");
+            if (!e || !*e) return 0;
+            char *end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            return (end == e) ? 0 : static_cast<std::size_t>(x);
+        }();
+        return cached;
+    }
+
+    /// Test-only override for `release_scratch_after()`. -1 (sentinel)
+    /// means "no override; use env cache". Setting any other value
+    /// bypasses the env. Production code never touches this — it's
+    /// intended for the L5 unit test, which can't reasonably spawn a
+    /// fresh thread to bust the env cache (large fixed-mode TLS makes
+    /// nested-thread stack overflow possible during fit()).
+    static std::size_t &release_after_test_override() {
+        static std::size_t v = static_cast<std::size_t>(-1);
+        return v;
+    }
+    static void set_release_after_for_testing(std::size_t v) {
+        release_after_test_override() = v;
+    }
+
+    /// Test-only probe: capacity (in elements, not bytes) of the
+    /// thread_local `xp_packed` buffer for this Function instantiation.
+    /// Used by the L5 unit test to assert shrink_to_fit fired. In L6
+    /// fixed-scratch mode the storage is a `std::array` whose size is
+    /// fixed at compile time — return it directly so the test can still
+    /// query (the L5 streak still runs in fixed mode but shrink_to_fit
+    /// is a no-op for the array buffers).
+    static std::size_t test_xp_packed_capacity() {
+        if constexpr (Scratch::fixed) {
+            return scratch().xp_packed.size();
+        } else {
+            return scratch().xp_packed.capacity();
+        }
+    }
+
+    /// Layer L4 (Phase 16): per-call tile size for the batch path. Read
+    /// once from the `BAOBZI_BATCH_TILE` env var, default 65536. 0
+    /// disables tiling (revert to the pre-L4 monolithic batch path —
+    /// useful for diff bisection).
+    static std::size_t batch_tile_size() {
+        static const std::size_t v = []() -> std::size_t {
+            const char *e = std::getenv("BAOBZI_BATCH_TILE");
+            if (!e || !*e) return 65536;
+            char *end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end == e) return 65536;
+            return static_cast<std::size_t>(x);
+        }();
+        return v;
+    }
+
     /// Batch evaluation: n_trg points written into res.
     ///
     /// Fast path groups points by owning leaf via counting sort, then invokes
@@ -1109,11 +1359,85 @@ class Function {
             const detail::Value<value_type, input_dim> xi(xp);
             const detail::Value<value_type, output_dim> tmp = (*this)(xi);
             std::copy(tmp.begin(), tmp.end(), res);
+            maybe_release_scratch(n_trg);
             return;
         }
 
         // Below this point the counting-sort overhead likely exceeds the
         // SIMD gain — fall through to scalar per-point.
+        constexpr std::size_t kSortThreshold = 32;
+        if (n_trg < kSortThreshold) {
+            for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
+                const detail::Value<value_type, input_dim> xi(xp + input_dim * i_trg);
+                const detail::Value<value_type, output_dim> tmp = (*this)(xi);
+                std::copy(tmp.begin(), tmp.end(), res + i_trg * output_dim);
+            }
+            maybe_release_scratch(n_trg);
+            return;
+        }
+
+        // Layer L4 (Phase 16): tile the batch path so the thread_local
+        // scratch resizes to `tile_K` rather than `n_trg`. Default 64 K
+        // covers the per-tile working set within L1d/L2 for low-leaf-
+        // count Functions (1D / 3D in the perf-driver). For high-leaf-
+        // count Functions (2D bump has ~7700 leaves) a hard 64 K tile
+        // gives only ~8 points per leaf per tile and the polyfit batch
+        // kernel's per-call setup overhead dominates — observed -19 %
+        // regression on 2D bump at K=64 K. The adaptive floor
+        // `n_leaves * kMinPtsPerLeaf` keeps each tile populated with
+        // enough points to amortise that setup, while the env override
+        // (`BAOBZI_BATCH_TILE`) is the floor — letting the user trade
+        // throughput for footprint on a per-Function basis. 0 disables
+        // tiling entirely (revert to the pre-L4 monolithic batch).
+        constexpr std::size_t kMinPtsPerLeaf = 32;
+        const std::size_t env_K = batch_tile_size();
+        // L6: when fixed-scratch is compiled in, the per-tile arrays
+        // are sized for `Scratch::kMaxTileK`. Cap tile_K at that limit
+        // and force tiling for large n_trg even when the user disabled
+        // it via env_K=0 — otherwise eval_batch_tile would index past
+        // the fixed buffer.
+        const std::size_t base_K = (env_K == 0)
+            ? (Scratch::fixed ? Scratch::kMaxTileK : 0)
+            : std::max(env_K, polyfits_.size() * kMinPtsPerLeaf);
+        const std::size_t tile_K = std::min(base_K, Scratch::kMaxTileK);
+        if (tile_K != 0 && n_trg > tile_K) {
+            for (std::size_t tile_off = 0; tile_off < n_trg; tile_off += tile_K) {
+                const std::size_t tile_n = std::min(tile_K, n_trg - tile_off);
+                eval_batch_tile(xp + input_dim * tile_off,
+                                res + output_dim * tile_off, tile_n);
+            }
+            maybe_release_scratch(n_trg);
+            return;
+        }
+        eval_batch_tile(xp, res, n_trg);
+        maybe_release_scratch(n_trg);
+    }
+
+    /// Layer L5 (Phase 16): when `BAOBZI_RELEASE_SCRATCH_AFTER` is set
+    /// to N > 0, shrink_to_fit the thread_local scratch after N
+    /// consecutive `operator()` calls below `kSmallCallThreshold`.
+    /// "Small" means the scratch was likely oversized for the call; a
+    /// streak of small calls suggests the hot batch is over and the
+    /// caller wants the capacity back. Big calls reset the streak. Off
+    /// by default — `release_scratch_after()` returns 0 → entire branch
+    /// folds away on first miss.
+    inline void maybe_release_scratch(std::size_t n_trg) const {
+        const std::size_t after_n = release_scratch_after();
+        if (after_n == 0) return;
+        constexpr std::size_t kSmallCallThreshold = 4096;
+        thread_local std::size_t small_streak = 0;
+        if (n_trg < kSmallCallThreshold) {
+            if (++small_streak >= after_n) {
+                small_streak = 0;
+                scratch().shrink_to_fit();
+            }
+        } else {
+            small_streak = 0;
+        }
+    }
+
+    inline void eval_batch_tile(const value_type *xp, value_type *res,
+                                std::size_t n_trg) const {
         constexpr std::size_t kSortThreshold = 32;
         if (n_trg < kSortThreshold) {
             for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
@@ -1129,34 +1453,82 @@ class Function {
 
         // Thread-local scratch reused across calls. Vectors amortize their
         // capacity so steady-state eval does no heap allocation.
-        thread_local std::vector<std::uint32_t> leaf_ids;
-        thread_local std::vector<std::uint32_t> counts;
-        thread_local std::vector<std::uint32_t> offsets;
-        thread_local std::vector<std::uint32_t> perm;
-        thread_local std::vector<value_type>    xp_packed;
-        thread_local std::vector<value_type>    out_packed;
+        // Layer L1 (Phase 14): `leaf_ids` is narrowed to u16 when
+        // `n_leaves <= 65535` (true for every perf-driver scenario and the
+        // overwhelming majority of practical Functions). Halves L1d traffic
+        // on the scatter's `leaf_ids[i]` load chain and saves 2 MiB of
+        // resident scratch at N=1e6. Reads zero-extend on x86 so the
+        // consuming code paths are unchanged. The u32 vector is kept for
+        // the rare > 65 K leaf fallback so that path keeps the original
+        // type.
+        // Layer L5 (Phase 16): scratch is hoisted into the per-Function
+        // `Scratch` struct accessed via `scratch()` so the L5 shrink path
+        // can reach the same TLS instance.
+        Scratch &sc = scratch();
+        auto &leaf_ids16 = sc.leaf_ids16; // std::vector or std::array
+        auto &leaf_ids32 = sc.leaf_ids32;
+        auto &counts     = sc.counts;     // always vector (sized by n_leaves)
+        auto &offsets    = sc.offsets;    // always vector
+        auto &perm       = sc.perm;
+        auto &xp_packed  = sc.xp_packed;
+        auto &out_packed = sc.out_packed;
 
-        leaf_ids.resize(n_trg);
+        const bool leaf_ids_fit_u16 =
+            n_leaves <= std::numeric_limits<std::uint16_t>::max();
+
+        // L6: when Scratch storage is fixed-array, the buffers are
+        // already sized at compile time for kMaxTileK. operator() caps
+        // tile_K at kMaxTileK so n_trg here is always within bounds —
+        // the resize calls become no-ops on arrays. counts/offsets are
+        // sized by n_leaves and stay heap-backed in either mode.
+        if constexpr (!Scratch::fixed) {
+            if (leaf_ids_fit_u16) leaf_ids16.resize(n_trg);
+            else                  leaf_ids32.resize(n_trg);
+            perm.resize(n_trg);
+            xp_packed.resize(input_dim * n_trg);
+            out_packed.resize(output_dim * n_trg);
+        } else {
+            assert(n_trg <= Scratch::kMaxTileK);
+        }
         counts.assign(n_leaves + 1, 0);
-        perm.resize(n_trg);
-        xp_packed.resize(input_dim * n_trg);
-        out_packed.resize(output_dim * n_trg);
 
         // Traversal: leaf id per point + population histogram.
-        for (std::size_t i = 0; i < n_trg; ++i) {
-            const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
-            bool in_domain = true;
-            poet::static_for<input_dim>([&](auto D) {
-                constexpr std::size_t d = D;
-                if (xi[d] < lower_left_[d] || xi[d] >= upper_right_[d])
-                    in_domain = false;
-            });
-            const std::uint32_t id = in_domain
-                ? subtrees_[get_linear_bin(xi)].find_node(xi).poly_eval_id
-                : ood_id;
-            leaf_ids[i] = id;
-            ++counts[id];
-        }
+        // Layer A: when there is a single subtree with a leaf table (the
+        // common case for compact domains — all four perf-driver scenarios
+        // hit this path), the subtree's quantize already covers the entire
+        // Function domain, so OOD detection collapses into the same
+        // unsigned-wrap test that produces the table index. The Function-
+        // level OOD pre-check (2·Dim `vcomisd`) and `get_linear_bin` (which
+        // returns 0 for n_subtrees==1 anyway) drop out entirely.
+        auto find_loop = [&](auto &leaf_ids_vec) {
+            using LeafIdT = std::remove_reference_t<decltype(leaf_ids_vec[0])>;
+            if (subtrees_.size() == 1 && subtrees_.front().has_leaf_table()) {
+                const auto &st = subtrees_.front();
+                for (std::size_t i = 0; i < n_trg; ++i) {
+                    const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
+                    const std::uint32_t id = st.find_leaf_id_with_ood(xi, ood_id);
+                    leaf_ids_vec[i] = static_cast<LeafIdT>(id);
+                    ++counts[id];
+                }
+            } else {
+                for (std::size_t i = 0; i < n_trg; ++i) {
+                    const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
+                    bool in_domain = true;
+                    poet::static_for<input_dim>([&](auto D) {
+                        constexpr std::size_t d = D;
+                        if (xi[d] < lower_left_[d] || xi[d] >= upper_right_[d])
+                            in_domain = false;
+                    });
+                    const std::uint32_t id = in_domain
+                        ? subtrees_[get_linear_bin(xi)].find_leaf_id(xi)
+                        : ood_id;
+                    leaf_ids_vec[i] = static_cast<LeafIdT>(id);
+                    ++counts[id];
+                }
+            }
+        };
+        if (leaf_ids_fit_u16) find_loop(leaf_ids16);
+        else                  find_loop(leaf_ids32);
 
         // Prefix sum — offsets[k] is the packed-buffer start for leaf k.
         offsets.resize(n_leaves + 1);
@@ -1170,21 +1542,25 @@ class Function {
 
         // Scatter inputs to packed layout. offsets[] is consumed as a cursor;
         // rebuilt from counts afterwards for the per-leaf dispatch.
-        for (std::size_t i = 0; i < n_trg; ++i) {
-            const std::uint32_t id = leaf_ids[i];
-            const std::uint32_t dst = offsets[id]++;
-            perm[dst] = static_cast<std::uint32_t>(i);
-            if constexpr (input_dim == 1) {
-                xp_packed[dst] = xp[i];
-            } else {
-                const value_type *src = xp + input_dim * i;
-                value_type *dstp = xp_packed.data() + input_dim * dst;
-                poet::static_for<input_dim>([&](auto D) {
-                    constexpr std::size_t d = D;
-                    dstp[d] = src[d];
-                });
+        auto scatter_loop = [&](const auto &leaf_ids_vec) {
+            for (std::size_t i = 0; i < n_trg; ++i) {
+                const std::uint32_t id = leaf_ids_vec[i];
+                const std::uint32_t dst = offsets[id]++;
+                perm[dst] = static_cast<std::uint32_t>(i);
+                if constexpr (input_dim == 1) {
+                    xp_packed[dst] = xp[i];
+                } else {
+                    const value_type *src = xp + input_dim * i;
+                    value_type *dstp = xp_packed.data() + input_dim * dst;
+                    poet::static_for<input_dim>([&](auto D) {
+                        constexpr std::size_t d = D;
+                        dstp[d] = src[d];
+                    });
+                }
             }
-        }
+        };
+        if (leaf_ids_fit_u16) scatter_loop(leaf_ids16);
+        else                  scatter_loop(leaf_ids32);
         {
             std::uint32_t run = 0;
             for (std::uint32_t k = 0; k <= n_leaves; ++k) {
@@ -1240,7 +1616,17 @@ class Function {
         }
 
         // Permute outputs back to caller order.
+        // Prefetch-for-write hides RFO latency on the random `res[perm[dst]]`
+        // store: with a random permutation each cacheline costs ~50-200 c
+        // RFO, which dominates 1D throughput post-Layer-A.
+        constexpr std::size_t LOOKAHEAD = 32;
         for (std::size_t dst = 0; dst < n_trg; ++dst) {
+#if defined(__GNUC__) || defined(__clang__)
+            if (dst + LOOKAHEAD < n_trg) {
+                const std::uint32_t s = perm[dst + LOOKAHEAD];
+                __builtin_prefetch(res + output_dim * s, /*rw=*/1, /*locality=*/0);
+            }
+#endif
             const std::uint32_t src = perm[dst];
             const value_type *srcp = out_packed.data() + output_dim * dst;
             value_type *dstp = res + output_dim * src;
