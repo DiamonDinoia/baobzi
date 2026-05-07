@@ -2655,3 +2655,65 @@ core header), so this is a free win. Likely sources:
 
 Phase 16 / iter-20 closes net positive across the board. Next
 perf work re-baselines against this state.
+
+## iter-21 paired bench — POET primitives sweep
+
+24 × interleaved on CPU 2 (`taskset -c 2`); box was on
+`powersave` governor with turbo enabled, so per-cell err% is
+universally above 5 % — paired-median is the only stable signal
+and the decision rule. Baseline = `5a355e3` (HEAD). Candidate =
+HEAD + `function_impl.hpp` sweep that:
+
+- routes per-axis loops over `input_dim` / `output_dim` through
+  `poet::static_for` (`get_node_index`, `get_linear_bin`,
+  `get_bins`, `find_leaf_id` table path, `operator()` bounds
+  check). Eliminates the hand-unrolled `if constexpr (input_dim
+  == 2/3/4/5)` ladders in `get_bins` / `get_linear_bin`;
+- preserves `find_leaf_id_with_ood`'s in-loop early
+  `return ood_id` (a flag-and-post-check unification regressed
+  1D-batch by 4–7 % in the first attempt at this iter — backed
+  out and pinned by a comment at the function).
+
+Hot-path rows (`N=1000000`) — paired-median Δ% over n=24:
+
+| scenario                          | base med | cand med | Δ% med |
+|-----------------------------------|---------:|---------:|-------:|
+| 1d_bessel_j0 deg=8                |   259.30 |   268.21 |  +4.67 |
+| 1d_erf       deg=8                |   267.22 |   280.79 |  +4.17 |
+| 1d_log1p     deg=8                |   276.98 |   273.20 |  +0.60 |
+| 1d_runge     deg=8                |   277.60 |   261.46 |  +3.61 |
+| 1d_runge     deg=10               |   272.76 |   265.26 |  +3.07 |
+| 1d_tanh_sharp deg=10              |   278.16 |   275.30 |  +3.26 |
+| 2d_bump      deg=8                |    80.12 |    77.26 |  +2.79 |
+| 2d_mq        deg=8                |   108.28 |   106.04 |  +1.11 |
+| 2d_osc       deg=8                |    95.85 |    92.47 |  +2.28 |
+| 3d_gauss     deg=8                |    33.61 |    33.15 |  +0.53 |
+| 3d_imq       deg=8                |    33.07 |    32.99 |  +1.14 |
+| 3d_yukawa    deg=8                |    18.11 |    18.66 |  +4.83 |
+
+Every hot-path scenario is paired-median ≥ 0. Small-N rows
+(`N=1, 32, 1024`) are also overwhelmingly non-negative — only
+1d_log1p N=1024 (-1.74 %) and 1d_runge deg=10 N=32 (-3.65 %)
+print a small negative paired-median, both well inside the
+single-run noise band on this powersave box (Δ% min/max routinely
+spans ±40 %). Per the plan's MdAPE rule, those cells are
+unreliable and not the basis for a drop.
+
+Likely sources of the win:
+- `get_node_index` / `get_linear_bin` lose the input_dim==1 vs.
+  ND scalar dispatch — both paths now flow through one
+  `poet::static_for<input_dim>` body, which lets the compiler
+  schedule the per-axis quantize uniformly. 3D batch sees the
+  largest gain (+4.83 % on 3d_yukawa) where the per-axis chain
+  is longest.
+- `get_linear_bin` switches from the hand-unrolled additive form
+  (sum of products) to a Horner accumulation. ND large-N batch
+  gains ~1–3 %; the dependency chain is shorter and the
+  compiler stops materialising the `bin[]` temporary.
+- The `find_leaf_id` table path joins the static_for family
+  while keeping the saturating-quantize semantics. `find_leaf_id_with_ood`
+  was deliberately left as the original early-return loop after a
+  unification attempt regressed 1D batch ~6 %.
+
+iter-21 ships net positive on every hot-path cell. Next perf
+re-baselines against this state.

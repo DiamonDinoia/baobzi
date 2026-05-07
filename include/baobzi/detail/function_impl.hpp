@@ -795,19 +795,16 @@ struct PolyTree {
             const std::size_t bits = leaf_table_depth_;
             const std::size_t mask = (std::size_t{1} << bits) - 1;
             std::size_t idx = 0;
-            if constexpr (input_dim == 1) {
-                std::size_t q0 = static_cast<std::size_t>(
-                    (x - lower_[0]) * inv_span_bins_[0]);
-                if (q0 > mask) q0 = mask;
-                idx = q0;
-            } else {
-                for (std::size_t d = 0; d < input_dim; ++d) {
-                    std::size_t qd = static_cast<std::size_t>(
-                        (x[d] - lower_[d]) * inv_span_bins_[d]);
-                    if (qd > mask) qd = mask;
-                    idx |= qd << (bits * d);
-                }
-            }
+            poet::static_for<input_dim>([&](auto D) {
+                constexpr std::size_t d = D;
+                const value_type xd = [&] {
+                    if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[d];
+                    else return x;
+                }();
+                std::size_t q = static_cast<std::size_t>((xd - lower_[d]) * inv_span_bins_[d]);
+                if (q > mask) q = mask;
+                idx |= q << (bits * d);
+            });
             return leaf_table_[idx];
         }
         return nodes_[get_node_index(x)].poly_eval_id;
@@ -822,11 +819,10 @@ struct PolyTree {
     /// into the table-index quantize: an out-of-range double yields
     /// INT64_MIN (x86-64 indefinite-integer), which compares above
     /// `mask` as uint64. Saves one cmp per axis vs. an explicit
-    /// in-domain pre-check.
-    ///
-    /// Precondition: single-subtree Function (this subtree's `lower_`
-    /// matches the Function's `lower_left_`). Multi-subtree callers
-    /// keep the Function-level OOD check + `get_linear_bin` path.
+    /// in-domain pre-check. The early `return ood_id;` inside the
+    /// per-axis loop keeps the OOD path off the hot fall-through —
+    /// flag-and-post-check formulations regressed 1D batch by 4–7 %
+    /// (paired-median, n=24).
     [[nodiscard]] BAOBZI_ALWAYS_INLINE std::uint32_t
     find_leaf_id_with_ood(const input_type &x, std::uint32_t ood_id) const {
         const std::size_t bits = leaf_table_depth_;
@@ -848,6 +844,7 @@ struct PolyTree {
         return leaf_table_[idx];
     }
 
+
     /// Descent hot loop. The per-subtree (lo, hi) bounds live in
     /// registers and `mid = 0.5 * (lo + hi)` is recomputed each level
     /// — the node carries no `center`, so descent is not load-bound.
@@ -862,19 +859,17 @@ struct PolyTree {
         index_t curr_index = 0;
         while (!nodes_[curr_index].is_leaf()) {
             index_t child_idx = 0;
-            if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) {
-                for (std::size_t i = 0; i < input_dim; ++i) {
-                    const value_type mid_i = (lo[i] + hi[i]) * value_type{0.5};
-                    const bool upper = (x[i] > mid_i);
-                    child_idx |= (static_cast<index_t>(upper) << i);
-                    (upper ? lo[i] : hi[i]) = mid_i;
-                }
-            } else {
-                const value_type mid = (lo[0] + hi[0]) * value_type{0.5};
-                const bool upper = (x > mid);
-                child_idx = static_cast<index_t>(upper);
-                (upper ? lo[0] : hi[0]) = mid;
-            }
+            poet::static_for<input_dim>([&](auto D) {
+                constexpr std::size_t d = D;
+                const value_type mid_d = (lo[d] + hi[d]) * value_type{0.5};
+                const value_type xd = [&] {
+                    if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[d];
+                    else return x;
+                }();
+                const bool upper = (xd > mid_d);
+                child_idx |= (static_cast<index_t>(upper) << d);
+                (upper ? lo[d] : hi[d]) = mid_d;
+            });
             curr_index = nodes_[curr_index].first_child_idx + child_idx;
         }
         return curr_index;
@@ -1104,58 +1099,38 @@ class Function {
     void build_cache() {}
 
     /// Convert linear bin index to [dim] bin vector.
-    std::array<std::size_t, input_dim> get_bins(const std::size_t i_bin) const {
-        if constexpr (input_dim == 1) {
-            return std::array<std::size_t, input_dim>{i_bin};
-        } else if constexpr (input_dim == 2) {
-            return std::array<std::size_t, input_dim>{i_bin % n_subtrees_[0], i_bin / n_subtrees_[0]};
-        } else if constexpr (input_dim == 3) {
-            return std::array<std::size_t, input_dim>{i_bin % n_subtrees_[0],
-                                                      (i_bin / n_subtrees_[0]) % n_subtrees_[1],
-                                                      i_bin / (n_subtrees_[0] * n_subtrees_[1])};
-        } else if constexpr (input_dim == 4) {
-            return std::array<std::size_t, input_dim>{
-                i_bin % n_subtrees_[0],
-                (i_bin / n_subtrees_[0]) % n_subtrees_[1],
-                (i_bin / (n_subtrees_[0] * n_subtrees_[1])) % n_subtrees_[2],
-                i_bin / (n_subtrees_[0] * n_subtrees_[1] * n_subtrees_[2])};
-        } else if constexpr (input_dim == 5) {
-            return std::array<std::size_t, input_dim>{
-                i_bin % n_subtrees_[0],
-                (i_bin / n_subtrees_[0]) % n_subtrees_[1],
-                (i_bin / (n_subtrees_[0] * n_subtrees_[1])) % n_subtrees_[2],
-                (i_bin / (n_subtrees_[0] * n_subtrees_[1] * n_subtrees_[2])) % n_subtrees_[3],
-                i_bin / (n_subtrees_[0] * n_subtrees_[1] * n_subtrees_[2] * n_subtrees_[3])};
-        }
+    std::array<std::size_t, input_dim> get_bins(std::size_t i_bin) const {
+        std::array<std::size_t, input_dim> out{};
+        poet::static_for<input_dim - 1>([&](auto D) {
+            constexpr std::size_t d = D;
+            out[d] = i_bin % n_subtrees_[d];
+            i_bin /= n_subtrees_[d];
+        });
+        out[input_dim - 1] = i_bin;
+        return out;
     }
 
     /// Find linear index of bin at a point.
     [[nodiscard]] BAOBZI_ALWAYS_INLINE std::size_t get_linear_bin(const input_type &x) const {
-        if constexpr (input_dim == 1) {
-            const value_type x_bin = [this, &x]() {
-                if constexpr (poly_eval::detail::hasTupleSize_v<input_type>)
-                    return x[0] - lower_left_[0];
-                else
-                    return x - lower_left_[0];
+        auto axis_bin = [&](auto I) -> std::size_t {
+            constexpr std::size_t i = I;
+            const value_type xi = [&] {
+                if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[i];
+                else return x;
             }();
-            return static_cast<std::size_t>(x_bin * inv_bin_size_[0]);
+            return static_cast<std::size_t>((xi - lower_left_[i]) * inv_bin_size_[i]);
+        };
+        if constexpr (input_dim == 1) {
+            return axis_bin(std::integral_constant<std::ptrdiff_t, 0>{});
         } else {
-            std::array<std::size_t, input_dim> bin{};
-            for (std::size_t i = 0; i < input_dim; ++i)
-                bin[i] = static_cast<std::size_t>((x[i] - lower_left_[i]) * inv_bin_size_[i]);
-
-            if constexpr (input_dim == 2) {
-                return bin[0] + n_subtrees_[0] * bin[1];
-            } else if constexpr (input_dim == 3) {
-                return bin[0] + n_subtrees_[0] * bin[1] + n_subtrees_[0] * n_subtrees_[1] * bin[2];
-            } else if constexpr (input_dim == 4) {
-                return bin[0] + n_subtrees_[0] * bin[1] + n_subtrees_[0] * n_subtrees_[1] * bin[2] +
-                       n_subtrees_[0] * n_subtrees_[1] * n_subtrees_[2] * bin[3];
-            } else if constexpr (input_dim == 5) {
-                return bin[0] + n_subtrees_[0] * bin[1] + n_subtrees_[0] * n_subtrees_[1] * bin[2] +
-                       n_subtrees_[0] * n_subtrees_[1] * n_subtrees_[2] * bin[3] +
-                       n_subtrees_[0] * n_subtrees_[1] * n_subtrees_[2] * n_subtrees_[3] * bin[4];
-            }
+            std::size_t result = axis_bin(std::integral_constant<std::ptrdiff_t, static_cast<std::ptrdiff_t>(input_dim) - 1>{});
+            // Horner-form: result accumulates from highest axis down.
+            poet::static_for<static_cast<std::ptrdiff_t>(input_dim) - 1>([&](auto K) {
+                constexpr std::ptrdiff_t r = static_cast<std::ptrdiff_t>(input_dim) - 2 - K;
+                result = result * n_subtrees_[r]
+                       + axis_bin(std::integral_constant<std::ptrdiff_t, r>{});
+            });
+            return result;
         }
     }
 
@@ -1183,11 +1158,46 @@ class Function {
     /// Functions would otherwise starve the polyfit batch kernel.
     static constexpr std::size_t kDefaultTileK = 65536;
 
-    /// Batch evaluation: n_trg points written into res.
+    /// Batch evaluation: `n_trg` points written into `res`.
     ///
-    /// Fast path groups points by owning leaf via counting sort, then invokes
-    /// polyfit's SIMD batch kernel once per leaf. Scalar per-point traversal
-    /// is kept for tiny batches where the sort cannot amortize.
+    /// Pipeline (unsorted, the general path):
+    ///
+    ///   1. **Leaf-id traversal.** For each input point, look up the owning
+    ///      leaf index (the `polyfits_` slot that holds its Chebyshev
+    ///      coefficients). When the Function has a single subtree with a
+    ///      precomputed leaf-table the lookup is a quantize + u32 load and
+    ///      folds OOD detection into the same unsigned wrap test. Otherwise
+    ///      we descend the tree per point. Out-of-domain points are tagged
+    ///      with the sentinel id `n_leaves` and counted in their own bucket.
+    ///   2. **Counting sort + prefix sum.** Histogram leaf populations into
+    ///      `counts[0..n_leaves]`, prefix-sum into `offsets[]`. After this
+    ///      `offsets[k]` is the start of leaf k's contiguous slot range in a
+    ///      packed buffer.
+    ///   3. **Scatter to packed layout.** Walk points in input order; for
+    ///      each, append its coordinates to `xp_packed` at its leaf's cursor
+    ///      and record the inverse mapping in `perm[dst] = i`. Result:
+    ///      points sharing a leaf land contiguously and in lock-step
+    ///      between `xp_packed` and the soon-to-be-filled `out_packed`.
+    ///   4. **Per-leaf SIMD batch eval.** For each non-empty leaf, hand its
+    ///      contiguous slice of `xp_packed` to polyfit's SIMD batch kernel
+    ///      once and write into the same slice of `out_packed`. This is the
+    ///      whole point of the sort: one fixed coefficient set, one SIMD
+    ///      Horner stream, no per-point branch on which leaf to evaluate.
+    ///      The OOD bucket is filled with NaN instead of evaluated.
+    ///   5. **Permute back to caller order.** For each `dst`, copy
+    ///      `out_packed[dst]` into `res[perm[dst] * output_dim]`. The store
+    ///      address is random in `res`, so we prefetch ahead by `LOOKAHEAD`
+    ///      to hide the RFO latency that otherwise dominates 1D throughput.
+    ///
+    /// Tiny batches (`n_trg < kSortThreshold`) skip stages 2–5 and just
+    /// loop point-at-a-time — the counting sort can't amortise its setup
+    /// at that size. Large batches are tiled (`kDefaultTileK`, lifted by an
+    /// adaptive floor for high-leaf-count Functions) so the packed buffers
+    /// fit in L1d/L2.
+    ///
+    /// For 1D, callers who can promise sortedness should prefer the
+    /// `(xp, res, n, baobzi::Sorted)` overload — it skips stages 2, 3, 5
+    /// entirely and runs ~3–4× faster.
     ///
     /// Thread-safe: a single Function may be called concurrently from
     /// multiple threads provided each call's `xp` and `res` slices do not
@@ -1234,9 +1244,97 @@ class Function {
         eval_batch_tile(xp, res, n_trg);
     }
 
-    /// Per-tile counting-sort + per-leaf SIMD batch eval. The caller
-    /// (`operator()`) ensures `n_trg >= kSortThreshold` and
-    /// `n_trg <= tile_K`, so this path always runs the sort.
+    /// Sorted-input batch evaluation (1D).
+    ///
+    /// The caller promises `xp[i] <= xp[i+1]`. Under that promise the
+    /// leaf-id sequence is monotone non-decreasing (1D leaves tile the
+    /// domain in coordinate order), so points sharing a leaf are
+    /// already contiguous in the input. That collapses the unsorted
+    /// pipeline's five stages to two:
+    ///
+    ///   * find the leaf at `i`, scan forward until the leaf changes,
+    ///   * dispatch the run `[i, j)` directly to polyfit's SIMD batch
+    ///     kernel writing straight into `res + i`.
+    ///
+    /// No `leaf_ids` write, no counts/prefix-sum, no scatter into
+    /// `xp_packed`, no permute back from `out_packed`, no `thread_local`
+    /// scratch — the input and output buffers themselves are the packed
+    /// layout, and the run-length scan amortises the per-leaf eval as
+    /// well as the counting sort did.
+    ///
+    /// OOD points form a contiguous prefix and/or suffix (since the
+    /// input is sorted) and are NaN-filled by two short guards around
+    /// the main loop.
+    ///
+    /// On a paired bench (1D, presorted, `-O3 -march=native`) this path
+    /// is ~3–4× faster than calling `operator()(xp, res, n)` on the
+    /// same buffer: ~1.5 ns/eval vs ~5.5 ns/eval at N=1e6 across both
+    /// the leaf-table fast path and the descent fallback. ins/eval drops
+    /// from ~36 to ~14 — exactly the work removed by skipping stages
+    /// 2, 3, 5 of the unsorted pipeline.
+    ///
+    /// `res` must hold `n * output_dim` elements. Restricted to
+    /// `input_dim == 1`: 2D/3D leaf-id sequences are not monotone under
+    /// single-axis sorting so the same trick does not apply.
+    BAOBZI_FLATTEN void operator()(const value_type *xp, value_type *res,
+                                   std::size_t n, sorted_t) const
+        requires (input_dim == 1)
+    {
+        if (n == 0) [[unlikely]] return;
+
+        constexpr value_type nan_v = std::numeric_limits<value_type>::quiet_NaN();
+        auto write_nan = [&](std::size_t i) {
+            for (std::size_t j = 0; j < output_dim; ++j)
+                res[i * output_dim + j] = nan_v;
+        };
+
+        const std::uint32_t n_leaves = static_cast<std::uint32_t>(polyfits_.size());
+        const std::uint32_t ood_id = n_leaves;
+        const bool fast = subtrees_.size() == 1 && subtrees_.front().has_leaf_table();
+
+        auto leaf_id_at = [&](std::size_t i) -> std::uint32_t {
+            const value_type x = xp[i];
+            if (fast)
+                return subtrees_.front().find_leaf_id_with_ood(x, ood_id);
+            if (x < lower_left_[0] || x >= upper_right_[0])
+                return ood_id;
+            return subtrees_[get_linear_bin(x)].find_leaf_id(x);
+        };
+
+        std::size_t i = 0;
+        // OOD prefix: sorted input means anything below lower_left_[0]
+        // is contiguous at the front.
+        while (i < n && xp[i] < lower_left_[0]) { write_nan(i); ++i; }
+
+        while (i < n) {
+            if (xp[i] >= upper_right_[0]) [[unlikely]] {
+                // OOD suffix begins here (and continues to the end).
+                do { write_nan(i); ++i; } while (i < n);
+                break;
+            }
+            const std::uint32_t id = leaf_id_at(i);
+            if (id == ood_id) [[unlikely]] {
+                // Fast-path quantize wrap can flag points slightly above
+                // the upper bound that survived the explicit prefix
+                // guards (e.g. NaN). Fall back to a per-point NaN here.
+                write_nan(i); ++i;
+                continue;
+            }
+            std::size_t j = i + 1;
+            while (j < n && leaf_id_at(j) == id) ++j;
+            polyfits_[id](xp + i, res + i, j - i);
+            i = j;
+        }
+    }
+
+    /// Per-tile body of the unsorted batch pipeline (stages 1–5, see the
+    /// `operator()(xp, res, n)` doc above). The caller ensures
+    /// `n_trg >= kSortThreshold` and `n_trg <= tile_K`, so this routine
+    /// always runs the full sort + scatter + per-leaf SIMD eval +
+    /// permute-back sequence. The scratch vectors (`leaf_ids*`,
+    /// `counts`/`offsets`, `perm`, `xp_packed`, `out_packed`) live in
+    /// `thread_local` storage and are reused across calls — steady-state
+    /// eval does no heap allocation.
     void eval_batch_tile(const value_type *xp, value_type *res,
                          std::size_t n_trg) const {
         const std::uint32_t n_leaves = static_cast<std::uint32_t>(polyfits_.size());
@@ -1412,15 +1510,16 @@ class Function {
 
     /// Point evaluation.
     [[nodiscard]] output_type operator()(const input_type &x) const {
-        if constexpr (input_dim == 1) {
-            if (x < lower_left_[0] || x >= upper_right_[0])
-                return output_type{NAN};
-        } else {
-            for (std::size_t i = 0; i < input_dim; ++i)
-                if (x[i] < lower_left_[i] || x[i] >= upper_right_[i])
-                    return output_type{NAN};
-        }
-
+        bool ood = false;
+        poet::static_for<input_dim>([&](auto D) {
+            constexpr std::size_t d = D;
+            const value_type xd = [&] {
+                if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[d];
+                else return x;
+            }();
+            if (xd < lower_left_[d] || xd >= upper_right_[d]) ood = true;
+        });
+        if (ood) [[unlikely]] return output_type{NAN};
         return polyfits_[find_node(x).poly_eval_id](x);
     }
 

@@ -24,6 +24,18 @@
 
 #include <polyfit/polyeval.hpp>
 
+namespace baobzi {
+
+/// Tag for `Function::operator()` overloads that promise the input is
+/// already sorted by ascending coordinate. 1D only — leaf-id sequences
+/// are monotone non-decreasing under that promise, so the batch path
+/// can stream points directly into per-leaf SIMD eval without a
+/// counting-sort + scatter + permute round-trip.
+struct sorted_t { explicit sorted_t() = default; };
+inline constexpr sorted_t Sorted{};
+
+} // namespace baobzi
+
 #include <baobzi/detail/function_impl.hpp>
 
 namespace baobzi {

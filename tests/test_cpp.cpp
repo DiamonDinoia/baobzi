@@ -236,6 +236,69 @@ TEST_CASE("Batch vs single evaluation agree", "[baobzi][batch]") {
     }
 }
 
+TEST_CASE("Sorted-1D batch matches unsorted batch and scalar", "[baobzi][batch][sorted]") {
+    auto run = [](auto fn, double a, double b) {
+        std::mt19937 gen(7);
+        std::uniform_real_distribution<double> d(a, b);
+        constexpr std::size_t N_IN = 4096;          // above kSortThreshold
+        constexpr std::size_t N_OOD_LO = 5;
+        constexpr std::size_t N_OOD_HI = 7;
+        const std::size_t N = N_IN + N_OOD_LO + N_OOD_HI;
+
+        std::vector<double> xs;
+        xs.reserve(N);
+        // OOD prefix (below lower).
+        for (std::size_t i = 0; i < N_OOD_LO; ++i)
+            xs.push_back(a - 1.0 - 0.1 * static_cast<double>(i));
+        // In-domain.
+        for (std::size_t i = 0; i < N_IN; ++i) xs.push_back(d(gen));
+        // OOD suffix (above upper).
+        for (std::size_t i = 0; i < N_OOD_HI; ++i)
+            xs.push_back(b + 1.0 + 0.1 * static_cast<double>(i));
+
+        std::sort(xs.begin(), xs.end());
+
+        std::vector<double> sorted_out(N);
+        fn(xs.data(), sorted_out.data(), N, baobzi::Sorted);
+
+        std::vector<double> batch_out(N);
+        fn(xs.data(), batch_out.data(), N);
+
+        constexpr double ulp = std::numeric_limits<double>::epsilon();
+        for (std::size_t i = 0; i < N; ++i) {
+            const bool ood = xs[i] < a || xs[i] >= b;
+            if (ood) {
+                REQUIRE(std::isnan(sorted_out[i]));
+                REQUIRE(std::isnan(batch_out[i]));
+            } else {
+                // Sorted path uses polyfit's SIMD batch kernel directly,
+                // so its output should match the unsorted batch bit-for-bit.
+                REQUIRE(sorted_out[i] == batch_out[i]);
+                const double scalar = fn(xs[i]);
+                REQUIRE(std::abs(scalar - sorted_out[i])
+                        <= 8.0 * ulp * std::max(1.0, std::abs(scalar)));
+            }
+        }
+    };
+
+    SECTION("shallow tree (leaf-table fast path)") {
+        // Smooth, low-curvature: tree stays shallow → leaf table built.
+        auto f = [](double x) { return std::sin(2.0 * x); };
+        auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10);
+        run(fn, 0.0, 1.0);
+    }
+
+    SECTION("deep tree (no leaf-table)") {
+        // A near-singular feature pushes the adaptive paneler past the
+        // leaf-table depth cap (14 bits in 1D), exercising the descent
+        // fallback in find_leaf_id.
+        auto f = [](double x) { return 1.0 / (x * x + 1e-6); };
+        auto fn = fit<8>(f, -1.0, 1.0, /*tol=*/1e-8,
+                         options{.max_depth = 30, .max_memory_mib = 256});
+        run(fn, -1.0, 1.0);
+    }
+}
+
 TEST_CASE("Batch vs single evaluation agree — 2D vector output", "[baobzi][batch][2d]") {
     auto f = [](std::array<double, 2> x) -> std::array<double, 2> {
         return {std::sin(x[0] + x[1]), std::cos(x[0] - x[1])};
@@ -244,10 +307,10 @@ TEST_CASE("Batch vs single evaluation agree — 2D vector output", "[baobzi][bat
 
     std::mt19937 gen(42);
     std::uniform_real_distribution<double> d(1e-3, 1.0 - 1e-3);
-    constexpr int N = 1024; // above counting-sort threshold
+    constexpr std::size_t N = 1024; // above counting-sort threshold
     std::vector<double> flat(2 * N);
     std::vector<std::array<double, 2>> pts(N);
-    for (int i = 0; i < N; ++i) {
+    for (std::size_t i = 0; i < N; ++i) {
         pts[i] = {d(gen), d(gen)};
         flat[2 * i]     = pts[i][0];
         flat[2 * i + 1] = pts[i][1];
@@ -257,7 +320,7 @@ TEST_CASE("Batch vs single evaluation agree — 2D vector output", "[baobzi][bat
     fn(flat.data(), batch.data(), N);
 
     constexpr double ulp = std::numeric_limits<double>::epsilon();
-    for (int i = 0; i < N; ++i) {
+    for (std::size_t i = 0; i < N; ++i) {
         const auto single = fn(pts[i]);
         REQUIRE(std::abs(single[0] - batch[2 * i])
                 <= 4.0 * ulp * std::max(1.0, std::abs(single[0])));
@@ -275,19 +338,19 @@ TEST_CASE("Batch vs single evaluation agree — 3D scalar output", "[baobzi][bat
 
     std::mt19937 gen(7);
     std::uniform_real_distribution<double> d(-0.99, 0.99);
-    constexpr int N = 2000;
+    constexpr std::size_t N = 2000;
     std::vector<double> flat(3 * N);
     std::vector<std::array<double, 3>> pts(N);
-    for (int i = 0; i < N; ++i) {
+    for (std::size_t i = 0; i < N; ++i) {
         pts[i] = {d(gen), d(gen), d(gen)};
-        for (int j = 0; j < 3; ++j) flat[3 * i + j] = pts[i][j];
+        for (std::size_t j = 0; j < 3; ++j) flat[3 * i + j] = pts[i][j];
     }
 
     std::vector<double> batch(N);
     fn(flat.data(), batch.data(), N);
 
     constexpr double ulp = std::numeric_limits<double>::epsilon();
-    for (int i = 0; i < N; ++i) {
+    for (std::size_t i = 0; i < N; ++i) {
         const auto single = fn(pts[i]);
         REQUIRE(std::abs(single[0] - batch[i])
                 <= 4.0 * ulp * std::max(1.0, std::abs(single[0])));
