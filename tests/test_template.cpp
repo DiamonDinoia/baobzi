@@ -13,8 +13,7 @@ TEST_CASE("1D1 evaluations", "[baobzi_template]") {
     const double b = center + half_l;
     constexpr double tol = 1e-10;
 
-    auto baobzifunc = baobzi::fit<8>(testfun_1d1, a, b, tol, baobzi::options{},
-                                     baobzi::SplitMultiEvalOff);
+    auto baobzifunc = baobzi::fit<8>(testfun_1d1, a, b, tol);
 
     SECTION("evaluations at lower left") {
         const double x = a;

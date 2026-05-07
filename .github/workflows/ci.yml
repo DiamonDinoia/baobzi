@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 3 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} (${{ matrix.toolchain }} ${{ matrix.build_type }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu Debug
+          - {os: ubuntu-24.04, toolchain: gcc,     build_type: Debug}
+          - {os: ubuntu-24.04, toolchain: gcc-13,  build_type: Debug}
+          - {os: ubuntu-24.04, toolchain: gcc-14,  build_type: Debug}
+          - {os: ubuntu-24.04, toolchain: llvm,    build_type: Debug}
+          - {os: ubuntu-24.04, toolchain: llvm-18, build_type: Debug}
+          - {os: ubuntu-24.04, toolchain: llvm-21, build_type: Debug}
+          # Ubuntu Release
+          - {os: ubuntu-24.04, toolchain: gcc,     build_type: Release}
+          - {os: ubuntu-24.04, toolchain: gcc-13,  build_type: Release}
+          - {os: ubuntu-24.04, toolchain: gcc-14,  build_type: Release}
+          - {os: ubuntu-24.04, toolchain: llvm,    build_type: Release}
+          - {os: ubuntu-24.04, toolchain: llvm-18, build_type: Release}
+          - {os: ubuntu-24.04, toolchain: llvm-21, build_type: Release}
+          # macOS
+          - {os: macos-14,     toolchain: apple-clang, build_type: Debug}
+          - {os: macos-14,     toolchain: apple-clang, build_type: Release}
+          # Windows
+          - {os: windows-2022, toolchain: msvc, build_type: Debug,   multi_config: true}
+          - {os: windows-2022, toolchain: msvc, build_type: Release, multi_config: true}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup C++ toolchain
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: ${{ matrix.toolchain }}
+          cmake: true
+          ninja: true
+          cache-tools: true
+          vcvarsall: ${{ runner.os == 'Windows' }}
+
+      # CI runners are heterogeneous; force a portable baseline so AVX-only
+      # binaries don't crash on hosts without it.
+      - name: Configure
+        if: ${{ !matrix.multi_config }}
+        shell: bash
+        run: |
+          SANITIZERS=OFF
+          if [ "$RUNNER_OS" = "Linux" ] && [ "${{ matrix.build_type }}" = "Debug" ]; then
+            SANITIZERS=ON
+          fi
+          ARCH=x86-64-v3
+          if [ "$RUNNER_OS" = "macOS" ]; then ARCH=apple-m1; fi
+          cmake -S . -B build/${{ matrix.build_type }} \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DBAOBZI_BUILD_TESTS=ON \
+            -DBAOBZI_BUILD_EXAMPLES=ON \
+            -DBAOBZI_STRICT_WARNINGS=ON \
+            -DBAOBZI_WARNINGS_AS_ERRORS=ON \
+            -DBAOBZI_ENABLE_SANITIZERS=${SANITIZERS} \
+            -DBAOBZI_ARCH=${ARCH}
+
+      - name: Build
+        if: ${{ !matrix.multi_config }}
+        run: cmake --build build/${{ matrix.build_type }}
+
+      - name: Test
+        if: ${{ !matrix.multi_config }}
+        run: ctest --output-on-failure --test-dir build/${{ matrix.build_type }}
+
+      - name: Configure (multi-config)
+        if: matrix.multi_config
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -A x64 `
+            -DBAOBZI_BUILD_TESTS=ON `
+            -DBAOBZI_BUILD_EXAMPLES=ON `
+            -DBAOBZI_STRICT_WARNINGS=ON `
+            -DBAOBZI_WARNINGS_AS_ERRORS=ON `
+            -DBAOBZI_ENABLE_SANITIZERS=OFF
+
+      - name: Build (multi-config)
+        if: matrix.multi_config
+        shell: pwsh
+        run: cmake --build build --config ${{ matrix.build_type }}
+
+      - name: Test (multi-config)
+        if: matrix.multi_config
+        shell: pwsh
+        run: ctest --output-on-failure --test-dir build -C ${{ matrix.build_type }}
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.toolchain }}-${{ matrix.build_type }}-logs
+          path: |
+            build/**/Testing/**/*.log
+            build/**/Testing/**/*.xml
+          if-no-files-found: ignore
+
+  analysis:
+    name: Static Analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy cppcheck ninja-build cmake
+
+      - name: Configure analysis
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build/analyze \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBAOBZI_BUILD_TESTS=ON \
+            -DBAOBZI_BUILD_EXAMPLES=OFF \
+            -DBAOBZI_STRICT_WARNINGS=ON \
+            -DBAOBZI_WARNINGS_AS_ERRORS=ON \
+            -DBAOBZI_ENABLE_SANITIZERS=OFF \
+            -DBAOBZI_ENABLE_CLANG_TIDY=ON \
+            -DBAOBZI_ENABLE_CPPCHECK=ON \
+            -DBAOBZI_ARCH=x86-64-v3
+
+      - name: Build (analysis)
+        env:
+          CC: clang
+          CXX: clang++
+        run: cmake --build build/analyze
+
+      - name: Test (analysis)
+        run: ctest --output-on-failure --test-dir build/analyze
+
+      - name: Upload analysis logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-logs
+          path: |
+            build/analyze/**/Testing/**/*.log
+            build/analyze/**/*.txt
+          if-no-files-found: ignore
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup C++ toolchain
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: gcc-13
+          cmake: true
+          ninja: true
+          cache-tools: true
+
+      - name: Install coverage tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov
+
+      - name: Configure (coverage)
+        run: |
+          cmake -S . -B build/coverage \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBAOBZI_BUILD_TESTS=ON \
+            -DBAOBZI_BUILD_EXAMPLES=OFF \
+            -DBAOBZI_ENABLE_SANITIZERS=OFF \
+            -DBAOBZI_ENABLE_COVERAGE=ON \
+            -DBAOBZI_ARCH=x86-64-v3
+
+      - name: Build coverage target
+        run: cmake --build build/coverage --target coverage
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            build/coverage/coverage.info
+            build/coverage/coverage.filtered.info
+            build/coverage/coverage/**
+            build/coverage/coverage-report.html
+          if-no-files-found: warn

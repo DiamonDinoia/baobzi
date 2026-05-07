@@ -20,8 +20,7 @@ using baobzi::fit;
 using baobzi::options;
 using baobzi::TolKind;
 
-// fit(lambda, a, b, tol) must select the Degree=8, SplitMultiEval=true
-// specialisation.
+// fit(lambda, a, b, tol) must select the Degree=8 specialisation.
 TEST_CASE("fit canonical overload type", "[baobzi][api][type]") {
     auto f = [](double x) { return x; };
     using actual_t = decltype(baobzi::fit(f, 0.0, 1.0, 1e-8));

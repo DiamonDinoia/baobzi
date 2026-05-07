@@ -79,22 +79,21 @@ int main(int argc, char **argv) {
     const bool run_2d = contains("2d");
     const bool run_3d = contains("3d");
 
-    const bool print_stats = std::getenv("BAOBZI_PRINT_STATS") != nullptr;
     if (run_1d) {
         auto fn = baobzi::fit<8>(make_gauss1d(), -3.0, 3.0, 1e-10);
-        if (print_stats) { std::printf("== 1d_gauss ==\n"); fn.print_stats(); }
+        std::printf("== 1d_gauss ==\n"); fn.print_stats();
         hammer<1>("1d_gauss deg=8 N=1e6", fn, {-3.0}, {3.0}, secs);
     }
     if (run_1d) {
         auto fn = baobzi::fit<8>(make_runge1d(), -1.0, 1.0, 1e-10);
-        if (print_stats) { std::printf("== 1d_runge ==\n"); fn.print_stats(); }
+        std::printf("== 1d_runge ==\n"); fn.print_stats();
         hammer<1>("1d_runge deg=8 N=1e6", fn, {-1.0}, {1.0}, secs);
     }
     if (run_2d) {
         auto fn = baobzi::fit<8>(make_bump2d(),
                                  std::array<double, 2>{0.0, 0.0},
                                  std::array<double, 2>{1.0, 1.0}, 1e-10);
-        if (print_stats) { std::printf("== 2d_bump ==\n"); fn.print_stats(); }
+        std::printf("== 2d_bump ==\n"); fn.print_stats();
         hammer<2>("2d_bump deg=8 N=1e6", fn,
                   {0.0, 0.0}, {1.0, 1.0}, secs);
     }
@@ -102,7 +101,7 @@ int main(int argc, char **argv) {
         auto fn = baobzi::fit<8>(make_gauss3d(),
                                  std::array<double, 3>{-1.0, -1.0, -1.0},
                                  std::array<double, 3>{1.0, 1.0, 1.0}, 1e-10);
-        if (print_stats) { std::printf("== 3d_gauss ==\n"); fn.print_stats(); }
+        std::printf("== 3d_gauss ==\n"); fn.print_stats();
         hammer<3>("3d_gauss deg=8 N=1e6", fn,
                   {-1.0, -1.0, -1.0}, {1.0, 1.0, 1.0}, secs);
     }

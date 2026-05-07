@@ -2516,3 +2516,142 @@ path with the documented 2D throughput tradeoff.
 
 Phase 16 fully closed: L4 ships unconditionally; L5 ships as
 opt-in feature; L6 ships as opt-in build-time variant.
+
+## Iteration 20 — POET/polyfit-style simplification pass
+
+Not a perf iteration — no measurements taken. Goal: cut accreted
+phase-history scaffolding now that the eval path has stabilised, so
+the header reads cleanly for the next perf cycle.
+
+### Pipe A — pure deletions
+- `include/baobzi_types.h` removed (zero references in tree).
+- `baobzi::SplitMultiEval<T>` tag + `SplitMultiEvalOn/Off`
+  constants removed; the trailing `Tag` template parameter is
+  off `baobzi::fit`. Three callsites that passed
+  `SplitMultiEvalOff` updated.
+- Legacy `int n_trg` overload of `Function::operator()` deleted;
+  the `std::size_t` overload covers it via implicit conversion.
+- Polyfit compatibility shims (`function_traits`,
+  `value_type_or_identity`, `has_tuple_size_v`) deleted; ~30
+  callsites updated to canonical `poly_eval::fitInput_t /
+  fitOutput_t / detail::value_type_or_t / detail::hasTupleSize_v`.
+
+### Pipe B — knob reduction
+- `BAOBZI_BATCH_TILE` env removed; tile size is hard-coded to
+  `kDefaultTileK = 65 536`. Adaptive floor (`n_leaves * 32`) stays.
+- L5 (`BAOBZI_RELEASE_SCRATCH_AFTER` env, streak counter,
+  `set_release_after_for_testing` hook, `test_xp_packed_capacity`
+  probe, the matching test) deleted. Vector scratch grows once
+  and reuses; no release knob is needed.
+- L6 / `BAOBZI_FIXED_SCRATCH` compile-time path deleted. The
+  std::vector path was already steady-state alloc-free, and
+  iter-16 closed without a recorded perf delta for L6. Saved ~30
+  lines of `#ifdef`, the `kMaxTileK` clamp logic in `operator()`,
+  and the `Scratch::shrink_to_fit()` helper (dead since L5 went).
+  No CMake option remains.
+- `BAOBZI_PRINT_STATS` env removed in `baobzi_perf_driver`; stats
+  are always printed.
+- `options::minimum_leaf_fraction` removed (default 0.0 made the
+  rebalancing branch unreachable; the `maybe_q` queue + the
+  per-level `leaf_fraction` accumulator in the BFS are gone).
+- `options::min_depth` removed (default 0 made the
+  force-deeper-tree branch dead).
+- `options::n_samples_per_dim` replaced by
+  `detail::kFitSamplesPerDim = 8` constant. Sample density is
+  no longer a runtime knob.
+- The four surviving fields (`tol_kind`, `max_depth`,
+  `max_memory_mib`, `allow_max_depth_leaves`) re-documented with
+  effect-on-behaviour, not phase history.
+
+### Pipe C — annotations + hot-path attributes
+- `[[nodiscard]]` swept across every const-getter / pure
+  predicate (`fit<>`, `Function::operator()(input_type)`,
+  `find_node`, `get_linear_bin`, `get_bounds`,
+  `non_converged_panels`, `memory_usage`, all Subtree / Value
+  accessors).
+- `constexpr` added to truly-pure getters
+  (`Subtree::has_leaf_table`, `size`, `max_depth`, all
+  `Value<T,N>` operator[] / begin / end forms).
+- `[[unlikely]]` on cold paths: `n_trg == 0`, `n_trg == 1` early
+  exits in batch `operator()`; per-axis OOD return in
+  `Subtree::find_leaf_id_with_ood`.
+- New `include/baobzi/detail/compiler_macros.hpp` providing
+  `BAOBZI_ALWAYS_INLINE` and `BAOBZI_FLATTEN` (bare GCC/Clang
+  attributes on C++20; no-op fallback elsewhere).
+- `BAOBZI_FLATTEN` on the batch entry `Function::operator()`.
+- `BAOBZI_ALWAYS_INLINE` on `Subtree::find_leaf_id_with_ood`
+  and `Function::get_linear_bin` (per-point inner loop).
+- 33 redundant `inline` keywords stripped from class-body
+  member-function definitions (implicit inline anyway).
+- Phase / Layer / iter-N tags stripped from `function_impl.hpp`
+  comments; the *why* commentary stays.
+
+### Pipe C.5 — fold guard out of `eval_batch_tile`
+The duplicate `n_trg < kSortThreshold` scalar fallback inside
+`eval_batch_tile` is gone; `operator()` filters the small-batch
+case before the tile loop, and `tile_K >= 65 536` makes any
+sub-32 tile impossible. Saves the redundant compare and one
+fallback path on the hot batch path.
+
+### Pipe C.8 — CI
+Seed `.github/workflows/ci.yml` adapted from polyfit:
+ubuntu-24.04 × {gcc, gcc-13, gcc-14, llvm, llvm-18, llvm-21} ×
+{Debug, Release}, macos-14/apple-clang, windows-2022/MSVC
+multi-config. ASan/UBSan on Linux Debug. Static Analysis job
+(clang-tidy + cppcheck via existing dev_helpers toggles).
+Coverage job (gcc-13 + lcov) gated on main. All non-MSVC configs
+build with `-DBAOBZI_ARCH=x86-64-v3` / `apple-m1` for runner
+portability.
+
+### Net SLOC delta
+- `include/baobzi/baobzi.hpp`: -23 lines (option doc rewrite).
+- `include/baobzi/detail/function_impl.hpp`: -210 lines.
+- `tests/test_cpp.cpp`: -50 lines (L5 test).
+- `examples/c++/baobzi_perf_driver.cpp`: -2 lines.
+- `include/baobzi_types.h`: file deleted.
+- `include/baobzi/detail/compiler_macros.hpp`: +18 lines (new).
+- `.github/workflows/ci.yml`: +210 lines (new).
+
+### Verification
+- ctest 34/34 green at every commit (one L5-specific test was
+  dropped along with the L5 code path).
+- Bench gate **deferred**: per-pipe paired bench was the original
+  plan, but the user signed off on the simplification first; the
+  next perf-driven iteration will rebaseline against this cleaned
+  state and quantify the [[likely]]/[[unlikely]] + flatten
+  effects directly.
+
+## iter-20 paired bench — simplification ships net positive
+
+24 × 5 s × 2 binaries, interleaved on CPU 2 (`taskset -c 2`),
+verified-idle box. Baseline = `ecccdda` (L6 ship, pre-pipe-A).
+Candidate = HEAD post-iter-20.
+
+| scenario | base med (Mevals/s) | cand med (Mevals/s) | Δ% paired-median | Δ% min | Δ% max |
+|----------|--------------------:|--------------------:|------------------:|-------:|-------:|
+| 1d_gauss |              277.23 |              303.20 |            +9.22 |  +7.82 | +10.94 |
+| 1d_runge |              275.18 |              306.57 |           +11.26 |  +8.88 | +12.93 |
+| 2d_bump  |               86.35 |               91.32 |            +5.68 |  +3.86 |  +8.03 |
+| 3d_gauss |               37.56 |               39.19 |            +4.09 |  -2.20 |  +5.52 |
+
+n=24 paired runs per scenario. No scenario regresses on the
+paired median. The 3d_gauss min of -2.2 % is single-run noise;
+median Δ% +4.09 is well clear of zero.
+
+The simplification was undertaken for clarity (-233 lines in the
+core header), so this is a free win. Likely sources:
+- `BAOBZI_FLATTEN` on the batch `operator()` makes the polyfit
+  per-leaf kernels inline through, dropping a call-frame on the
+  hot path.
+- `BAOBZI_ALWAYS_INLINE` on `find_leaf_id_with_ood` /
+  `get_linear_bin` blocks the per-point inner-loop body from
+  being out-of-lined under register pressure.
+- Removing the `maybe_q` / `leaf_fraction` BFS bookkeeping
+  shrinks the constructor — not the hot path itself, but it
+  drops a pile of fit-time temporaries that do not survive into
+  the eval-side codegen and were generating noise in `objdump`.
+- `[[unlikely]]` on `n_trg ∈ {0,1}` and the per-axis OOD return
+  encourages cold paths off the fall-through line.
+
+Phase 16 / iter-20 closes net positive across the board. Next
+perf work re-baselines against this state.

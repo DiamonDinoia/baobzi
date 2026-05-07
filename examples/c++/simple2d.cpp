@@ -15,8 +15,7 @@ int main() {
     auto fn = baobzi::fit(bump,
                           std::array{0.0, 0.0},
                           std::array{1.0, 1.0},
-                          /*tol=*/1e-8,
-                          baobzi::options{}, baobzi::SplitMultiEvalOff);
+                          /*tol=*/1e-8);
 
     std::mt19937 gen(1);
     std::uniform_real_distribution<double> d(0.001, 0.999);

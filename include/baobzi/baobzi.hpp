@@ -28,36 +28,33 @@
 
 namespace baobzi {
 
-/// Deprecated no-op tag. The batch path now always splits traversal from
-/// evaluation and groups points by leaf — there is no longer a "scalar-loop"
-/// variant to select. Kept as a type alias so older call sites that pass
-/// `baobzi::SplitMultiEvalOff` still compile.
-template <bool B> using SplitMultiEval = std::bool_constant<B>;
-inline constexpr SplitMultiEval<true>  SplitMultiEvalOn{};
-inline constexpr SplitMultiEval<false> SplitMultiEvalOff{};
-
-/// Runtime fit knobs. Every field here only affects fit-time construction;
-/// there is no eval-time benefit to promoting any of them to a template
-/// parameter, so they stay plain data.
+/// Runtime fit knobs. Every field here only affects fit-time
+/// construction; there is no eval-time benefit to promoting any of them
+/// to a template parameter, so they stay plain data.
 struct options {
-    TolKind tol_kind              = TolKind::RelativeMax;
-    double  minimum_leaf_fraction = 0.0;
-    int     min_depth             = 0;
-    int     max_depth             = 50;
-    int     n_samples_per_dim     = 8;
+    /// How `tol` is interpreted by the convergence check. The default
+    /// (`RelativeMax`) compares max-abs error on a sample grid against
+    /// `tol * max(|f|)`; switch to `Absolute*` when `f` can be zero or
+    /// when relative accuracy isn't meaningful.
+    TolKind tol_kind = TolKind::RelativeMax;
+    /// Tree-depth ceiling for the adaptive paneler. Hitting it without
+    /// converging throws `MaxDepthExceeded` (or, with
+    /// `allow_max_depth_leaves`, accepts the panel as best-effort).
+    /// 50 is far above what any non-singular function needs; lower it
+    /// to fail fast when a near-singularity is suspected.
+    int     max_depth = 50;
     /// Soft cap on accumulated leaf storage during the fit, in MiB.
-    /// `MemoryBudgetExceeded` is thrown if the budget is exceeded; set
-    /// to `0` to disable the check. Default 64 MiB sits below typical
-    /// LLCs (Sapphire Rapids ~60 MB, Zen4 ~96 MB shared, M1-class
-    /// ~24–48 MB) so the resulting evaluator stays cache-resident
-    /// alongside the caller's working set. Raise it for ambitious 3D+
-    /// fits — `MemoryBudgetExceeded` carries the offending panel so the
-    /// caller can locate the singular region or bump the cap deliberately.
-    int     max_memory_mib        = 64;
-    /// When true, panels that hit `max_depth` without converging are kept as
-    /// best-effort leaves (no exception). Inspect them via
-    /// `Function::non_converged_panels()`. Default false (throw with the
-    /// panel list attached on the exception).
+    /// `MemoryBudgetExceeded` is thrown when crossed; set to `0` to
+    /// disable. 64 MiB sits below typical LLCs (Sapphire Rapids
+    /// ~60 MB, Zen4 ~96 MB shared, M1-class ~24–48 MB) so the
+    /// evaluator stays cache-resident alongside the caller's working
+    /// set. Raise for ambitious 3D+ fits — the exception carries the
+    /// offending panel so the caller can locate the singular region.
+    int     max_memory_mib = 64;
+    /// When true, panels that fail tolerance at `max_depth` are kept
+    /// as best-effort leaves. Inspect them via
+    /// `Function::non_converged_panels()`. Default false (throw, with
+    /// the panel list attached on the exception).
     bool    allow_max_depth_leaves = false;
 };
 
@@ -74,16 +71,13 @@ inline constexpr std::size_t kDefaultDegree = 8;
 inline TreeInput make_input(int input_dim, int output_dim, int degree,
                             double tol, const options &opts) {
     TreeInput in{};
-    in.input_dim             = input_dim;
-    in.output_dim            = output_dim;
-    in.degree                = degree;
-    in.tol                   = tol;
-    in.minimum_leaf_fraction = opts.minimum_leaf_fraction;
-    in.min_depth             = opts.min_depth;
-    in.max_depth             = opts.max_depth;
-    in.tol_kind              = opts.tol_kind;
-    in.n_samples_per_dim     = opts.n_samples_per_dim;
-    in.max_memory_mib        = opts.max_memory_mib;
+    in.input_dim              = input_dim;
+    in.output_dim             = output_dim;
+    in.degree                 = degree;
+    in.tol                    = tol;
+    in.tol_kind               = opts.tol_kind;
+    in.max_depth              = opts.max_depth;
+    in.max_memory_mib         = opts.max_memory_mib;
     in.allow_max_depth_leaves = opts.allow_max_depth_leaves;
     return in;
 }
@@ -126,11 +120,9 @@ constexpr int domain_dim() {
 /// of the adaptive tree; the leaf degree is a hyperparameter with a
 /// reasonable default. `tol` is positional (no default) so every call site
 /// makes its target accuracy explicit.
-template <std::size_t Degree = detail::kDefaultDegree, class Func, class Domain,
-          class Tag = SplitMultiEval<true>>
+template <std::size_t Degree = detail::kDefaultDegree, class Func, class Domain>
     requires Fittable<Func, Domain>
-inline auto fit(Func f, Domain a, Domain b, double tol, options opts = {},
-                Tag = {}) {
+[[nodiscard]] auto fit(Func f, Domain a, Domain b, double tol, options opts = {}) {
     if (!(tol > 0.0))
         throw std::invalid_argument(
             "baobzi::fit: tolerance must be > 0");
