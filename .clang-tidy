@@ -25,3 +25,9 @@ CheckOptions:
     value: '5'
   - key: modernize-use-auto.RemoveStars
     value: 'true'
+  # `poet::static_for` lives in poet/core/static_for.hpp, but `core/*` is
+  # explicitly non-public — the only sanctioned entry point is the
+  # `<poet/poet.hpp>` umbrella. Tell include-cleaner not to flag it as
+  # "not used directly".
+  - key: misc-include-cleaner.IgnoreHeaders
+    value: 'poet/poet\.hpp'

@@ -22,7 +22,7 @@ class Value {
 
     /// Apply binary `op` elementwise against another `Value`.
     template <class Op>
-    constexpr Value apply(const Value &rhs, Op op) const {
+    constexpr auto apply(const Value &rhs, Op op) const -> Value {
         if constexpr (N == 1) {
             return Value(static_cast<T>(op(data_, rhs.data_)));
         } else {
@@ -35,7 +35,7 @@ class Value {
 
     /// Apply binary `op` against a broadcast scalar.
     template <class Op>
-    constexpr Value apply_scalar(const T &rhs, Op op) const {
+    constexpr auto apply_scalar(const T &rhs, Op op) const -> Value {
         if constexpr (N == 1) {
             return Value(static_cast<T>(op(data_, rhs)));
         } else {
@@ -64,24 +64,24 @@ class Value {
         if constexpr (N == 1) {
             data_ = arr[0];
         } else {
-            poet::static_for<N>([&](auto I) {
+            poet::static_for<N>([&](auto I) -> void {
                 constexpr std::size_t i = I;
                 data_[i] = arr[i];
             });
         }
     }
 
-    Value operator+(const Value &rhs) const { return apply(rhs, [](T a, T b) { return a + b; }); }
-    Value operator-(const Value &rhs) const { return apply(rhs, [](T a, T b) { return a - b; }); }
-    Value operator*(const Value &rhs) const { return apply(rhs, [](T a, T b) { return a * b; }); }
-    Value operator/(const Value &rhs) const { return apply(rhs, [](T a, T b) { return a / b; }); }
+    auto operator+(const Value &rhs) const -> Value { return apply(rhs, [](T a, T b) { return a + b; }); }
+    auto operator-(const Value &rhs) const -> Value { return apply(rhs, [](T a, T b) { return a - b; }); }
+    auto operator*(const Value &rhs) const -> Value { return apply(rhs, [](T a, T b) { return a * b; }); }
+    auto operator/(const Value &rhs) const -> Value { return apply(rhs, [](T a, T b) { return a / b; }); }
 
-    Value operator+(const T &rhs) const { return apply_scalar(rhs, [](T a, T b) { return a + b; }); }
-    Value operator-(const T &rhs) const { return apply_scalar(rhs, [](T a, T b) { return a - b; }); }
-    Value operator*(const T &rhs) const { return apply_scalar(rhs, [](T a, T b) { return a * b; }); }
-    Value operator/(const T &rhs) const { return apply_scalar(rhs, [](T a, T b) { return a / b; }); }
+    auto operator+(const T &rhs) const -> Value { return apply_scalar(rhs, [](T a, T b) { return a + b; }); }
+    auto operator-(const T &rhs) const -> Value { return apply_scalar(rhs, [](T a, T b) { return a - b; }); }
+    auto operator*(const T &rhs) const -> Value { return apply_scalar(rhs, [](T a, T b) { return a * b; }); }
+    auto operator/(const T &rhs) const -> Value { return apply_scalar(rhs, [](T a, T b) { return a / b; }); }
 
-    constexpr T &operator[](std::size_t idx) {
+    constexpr auto operator[](std::size_t idx) -> T & {
         if constexpr (N == 1) {
             static_cast<void>(idx);
             return data_;
@@ -90,7 +90,7 @@ class Value {
         }
     }
 
-    [[nodiscard]] constexpr const T &operator[](std::size_t idx) const {
+    [[nodiscard]] constexpr auto operator[](std::size_t idx) const -> const T & {
         if constexpr (N == 1) {
             static_cast<void>(idx);
             return data_;
@@ -99,24 +99,24 @@ class Value {
         }
     }
 
-    constexpr T *begin() {
+    constexpr auto begin() -> T * {
         if constexpr (N == 1) return &data_;
         else                  return data_.data();
     }
-    constexpr T *end() {
+    constexpr auto end() -> T * {
         if constexpr (N == 1) return &data_ + 1;
         else                  return data_.data() + N;
     }
-    [[nodiscard]] constexpr const T *begin() const {
+    [[nodiscard]] constexpr auto begin() const -> const T * {
         if constexpr (N == 1) return &data_;
         else                  return data_.data();
     }
-    [[nodiscard]] constexpr const T *end() const {
+    [[nodiscard]] constexpr auto end() const -> const T * {
         if constexpr (N == 1) return &data_ + 1;
         else                  return data_.data() + N;
     }
 
-    [[nodiscard]] T prod() const {
+    [[nodiscard]] auto prod() const -> T {
         if constexpr (N == 1) {
             return data_;
         } else {
@@ -127,7 +127,7 @@ class Value {
         }
     }
 
-    [[nodiscard]] storage_t get() const { return data_; }
+    [[nodiscard]] auto get() const -> storage_t { return data_; }
 
     operator T() const {
         static_assert(N == 1, "Can only cast to scalar if N == 1");
@@ -139,11 +139,11 @@ class Value {
         return data_;
     }
 
-    [[nodiscard]] const T &scalar() const {
+    [[nodiscard]] auto scalar() const -> const T & {
         static_assert(N == 1, "Not a scalar");
         return data_;
     }
-    [[nodiscard]] const std::array<T, N> &array() const {
+    [[nodiscard]] auto array() const -> const std::array<T, N> & {
         static_assert(N != 1, "Not an array");
         return data_;
     }
@@ -151,7 +151,7 @@ class Value {
     /// Always-array view: useful for passing the underlying coordinates to
     /// generic vector-of-double sinks (e.g. exception ctors) without
     /// branching on `N` at the call site.
-    [[nodiscard]] std::array<T, N> as_array() const {
+    [[nodiscard]] auto as_array() const -> std::array<T, N> {
         if constexpr (N == 1) {
             return std::array<T, N>{data_};
         } else {

@@ -94,7 +94,7 @@ struct PolyTree {
 
                         // Extract sign of each offset component from the bits of child.
                         for (std::size_t j = 0; j < input_dim; ++j) {
-                            const value_type signed_hw[2] = {-half_width[j], half_width[j]};
+                            const std::array<value_type, 2> signed_hw{-half_width[j], half_width[j]};
                             center_offset[j] = node_center[j] + signed_hw[(child >> j) & index_t{1}];
                         }
 
@@ -177,17 +177,17 @@ struct PolyTree {
         }
     }
 
-    const node_t &find_node(const input_type &x) const { return nodes_[get_node_index(x)]; }
+    auto find_node(const input_type &x) const -> const node_t & { return nodes_[get_node_index(x)]; }
 
     /// Combined leaf-id lookup: table if available, else descent.
-    [[nodiscard]] std::uint32_t find_leaf_id(const input_type &x) const {
+    [[nodiscard]] auto find_leaf_id(const input_type &x) const -> std::uint32_t {
         if (!leaf_table_.empty()) {
             const std::size_t bits = leaf_table_depth_;
             const std::size_t mask = (std::size_t{1} << bits) - 1;
             std::size_t idx = 0;
-            poet::static_for<input_dim>([&](auto D) {
+            poet::static_for<input_dim>([&](auto D) -> void {
                 constexpr std::size_t d = D;
-                const value_type xd = [&] {
+                const value_type xd = [&]() -> value_type {
                     if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[d];
                     else return x;
                 }();
@@ -200,7 +200,7 @@ struct PolyTree {
         return nodes_[get_node_index(x)].poly_eval_id;
     }
 
-    [[nodiscard]] constexpr bool has_leaf_table() const noexcept { return !leaf_table_.empty(); }
+    [[nodiscard]] constexpr auto has_leaf_table() const noexcept -> bool { return !leaf_table_.empty(); }
 
     /// Leaf-id lookup that returns `ood_id` for points outside this
     /// subtree's domain. Caller must have verified `has_leaf_table()`.
@@ -213,8 +213,8 @@ struct PolyTree {
     /// per-axis loop keeps the OOD path off the hot fall-through —
     /// flag-and-post-check formulations regressed 1D batch by 4–7 %
     /// (paired-median, n=24).
-    [[nodiscard]] BAOBZI_ALWAYS_INLINE std::uint32_t
-    find_leaf_id_with_ood(const input_type &x, std::uint32_t ood_id) const {
+    [[nodiscard]] BAOBZI_ALWAYS_INLINE auto
+    find_leaf_id_with_ood(const input_type &x, std::uint32_t ood_id) const -> std::uint32_t {
         const std::size_t bits = leaf_table_depth_;
         const std::size_t mask = (std::size_t{1} << bits) - 1;
         std::size_t idx = 0;
@@ -243,16 +243,16 @@ struct PolyTree {
     /// `mid` is computed differently from the fit-time
     /// `box.center` (chained halving), so bit-exactness at boundary
     /// points is not guaranteed; tests assert relative tolerance.
-    [[nodiscard]] std::size_t get_node_index(const input_type &x) const {
+    [[nodiscard]] auto get_node_index(const input_type &x) const -> std::size_t {
         dim_array_t lo = lower_;
         dim_array_t hi = upper_;
         index_t curr_index = 0;
         while (!nodes_[curr_index].is_leaf()) {
             index_t child_idx = 0;
-            poet::static_for<input_dim>([&](auto D) {
+            poet::static_for<input_dim>([&](auto D) -> void {
                 constexpr std::size_t d = D;
                 const value_type mid_d = (lo[d] + hi[d]) * value_type{0.5};
-                const value_type xd = [&] {
+                const value_type xd = [&]() -> value_type {
                     if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[d];
                     else return x;
                 }();
@@ -265,10 +265,10 @@ struct PolyTree {
         return curr_index;
     }
 
-    [[nodiscard]] constexpr std::size_t size() const { return nodes_.size(); }
-    [[nodiscard]] constexpr std::size_t max_depth() const { return max_depth_; }
+    [[nodiscard]] constexpr auto size() const -> std::size_t { return nodes_.size(); }
+    [[nodiscard]] constexpr auto max_depth() const -> std::size_t { return max_depth_; }
 
-    [[nodiscard]] std::size_t memory_usage() const {
+    [[nodiscard]] auto memory_usage() const -> std::size_t {
         std::size_t total = sizeof(*this);
         for (const auto &node : nodes_)
             total += node.memory_usage();
@@ -278,7 +278,7 @@ struct PolyTree {
     auto &get_nodes() { return nodes_; }
     auto &get_nodes() const { return nodes_; }
 
-    const std::vector<NonConvergedPanel> &non_converged_panels() const {
+    auto non_converged_panels() const -> const std::vector<NonConvergedPanel> & {
         return non_converged_panels_;
     }
 

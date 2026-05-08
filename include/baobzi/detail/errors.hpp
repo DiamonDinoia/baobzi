@@ -24,9 +24,9 @@ namespace detail {
 /// Pretty-print a half-open panel `[a, b)` (1D) or its Cartesian-product
 /// form `[[a0,b0) x [a1,b1) x ...]` (ND) into `os`. Shared between the
 /// two exception types so the message format stays uniform.
-inline void format_domain(std::ostringstream &os,
+inline auto format_domain(std::ostringstream &os,
                           const std::vector<double> &a,
-                          const std::vector<double> &b) {
+                          const std::vector<double> &b) -> void {
     if (a.size() == 1) {
         os << "[" << a[0] << ", " << b[0] << ")";
         return;
@@ -85,15 +85,15 @@ class MaxDepthExceeded : public std::exception {
         msg_ = os.str();
     }
 
-    [[nodiscard]] std::size_t                depth() const noexcept { return depth_; }
+    [[nodiscard]] auto depth() const noexcept -> std::size_t { return depth_; }
     /// Lower bound(s) of the first unconverged panel [a, b). Legacy accessor;
     /// for the full list use `panels()`.
-    [[nodiscard]] const std::vector<double> &a()     const noexcept { return a_; }
+    [[nodiscard]] auto a()     const noexcept -> const std::vector<double> & { return a_; }
     /// Upper bound(s) of the first unconverged panel [a, b).
-    [[nodiscard]] const std::vector<double> &b()     const noexcept { return b_; }
+    [[nodiscard]] auto b()     const noexcept -> const std::vector<double> & { return b_; }
     /// Full list of unconverged panels gathered before the throw.
-    [[nodiscard]] const std::vector<NonConvergedPanel> &panels() const noexcept { return panels_; }
-    [[nodiscard]] const char                *what()  const noexcept override { return msg_.c_str(); }
+    [[nodiscard]] auto panels() const noexcept -> const std::vector<NonConvergedPanel> & { return panels_; }
+    [[nodiscard]] auto what()  const noexcept -> const char * override { return msg_.c_str(); }
 
   private:
     std::size_t         depth_ = 0;
@@ -132,11 +132,11 @@ class MemoryBudgetExceeded : public std::exception {
         msg_ = os.str();
     }
 
-    [[nodiscard]] std::size_t                used_bytes()   const noexcept { return used_bytes_; }
-    [[nodiscard]] std::size_t                budget_bytes() const noexcept { return budget_bytes_; }
-    [[nodiscard]] const std::vector<double> &a()            const noexcept { return a_; }
-    [[nodiscard]] const std::vector<double> &b()            const noexcept { return b_; }
-    [[nodiscard]] const char                *what()         const noexcept override { return msg_.c_str(); }
+    [[nodiscard]] auto used_bytes()   const noexcept -> std::size_t { return used_bytes_; }
+    [[nodiscard]] auto budget_bytes() const noexcept -> std::size_t { return budget_bytes_; }
+    [[nodiscard]] auto a()            const noexcept -> const std::vector<double> & { return a_; }
+    [[nodiscard]] auto b()            const noexcept -> const std::vector<double> & { return b_; }
+    [[nodiscard]] auto what()         const noexcept -> const char * override { return msg_.c_str(); }
 
   private:
     std::size_t         used_bytes_   = 0;

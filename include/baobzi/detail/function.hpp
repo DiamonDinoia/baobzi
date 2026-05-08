@@ -56,7 +56,7 @@ class Function {
     /// Approximate resident bytes — including subtree node arrays and the
     /// shared polyfit coefficient store. Useful for budget validation in
     /// callers that build many Functions.
-    [[nodiscard]] std::size_t memory_usage() const {
+    [[nodiscard]] auto memory_usage() const -> std::size_t {
         std::size_t mem = sizeof(*this);
         mem += polyfits_.capacity() * sizeof(poly_eval_type);
         for (const auto &subtree : subtrees_)
@@ -66,7 +66,7 @@ class Function {
 
     /// Print a one-screen summary of the fit (node/leaf counts, depth, fit-
     /// time eval count, wall time, memory).
-    void print_stats() const {
+    auto print_stats() const -> void {
         std::size_t n_nodes = 0;
         std::size_t n_leaves = 0;
         const std::size_t n_subtrees = subtrees_.size();
@@ -148,7 +148,7 @@ class Function {
 
                     // Extract sign of each offset component from the bits of child.
                     for (std::size_t j = 0; j < input_dim; ++j) {
-                        const value_type signed_hw[2] = {-child_hw[j], child_hw[j]};
+                        const std::array<value_type, 2> signed_hw{-child_hw[j], child_hw[j]};
                         offset_center[j] = parent_center[j] + signed_hw[(child >> j) & std::size_t{1}];
                     }
 
@@ -245,9 +245,9 @@ class Function {
     }
 
     /// Convert linear bin index to [dim] bin vector.
-    [[nodiscard]] std::array<std::size_t, input_dim> get_bins(std::size_t i_bin) const {
+    [[nodiscard]] auto get_bins(std::size_t i_bin) const -> std::array<std::size_t, input_dim> {
         std::array<std::size_t, input_dim> out{};
-        poet::static_for<input_dim - 1>([&](auto D) {
+        poet::static_for<input_dim - 1>([&](auto D) -> void {
             constexpr std::size_t d = D;
             out[d] = i_bin % n_subtrees_[d];
             i_bin /= n_subtrees_[d];
@@ -257,10 +257,10 @@ class Function {
     }
 
     /// Find linear index of bin at a point.
-    [[nodiscard]] BAOBZI_ALWAYS_INLINE std::size_t get_linear_bin(const input_type &x) const {
+    [[nodiscard]] BAOBZI_ALWAYS_INLINE auto get_linear_bin(const input_type &x) const -> std::size_t {
         auto axis_bin = [&](auto I) -> std::size_t {
             constexpr std::size_t i = I;
-            const value_type xi = [&] {
+            const value_type xi = [&]() -> value_type {
                 if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[i];
                 else return x;
             }();
@@ -271,7 +271,7 @@ class Function {
         } else {
             std::size_t result = axis_bin(std::integral_constant<std::ptrdiff_t, static_cast<std::ptrdiff_t>(input_dim) - 1>{});
             // Horner-form: result accumulates from highest axis down.
-            poet::static_for<static_cast<std::ptrdiff_t>(input_dim) - 1>([&](auto K) {
+            poet::static_for<static_cast<std::ptrdiff_t>(input_dim) - 1>([&](auto K) -> void {
                 constexpr std::ptrdiff_t r = static_cast<std::ptrdiff_t>(input_dim) - 2 - K;
                 result = result * n_subtrees_[r]
                        + axis_bin(std::integral_constant<std::ptrdiff_t, r>{});
@@ -280,7 +280,7 @@ class Function {
         }
     }
 
-    [[nodiscard]] const node_t &find_node(const input_type &x) const { return subtrees_[get_linear_bin(x)].find_node(x); }
+    [[nodiscard]] auto find_node(const input_type &x) const -> const node_t & { return subtrees_[get_linear_bin(x)].find_node(x); }
 
     /// Per-thread, per-Function-instantiation scratch for the batch
     /// path. Vectors grow on first use and reuse capacity thereafter,
@@ -355,7 +355,7 @@ class Function {
     /// @param xp     `n_trg * input_dim` packed input coordinates.
     /// @param res    `n_trg * output_dim` output buffer.
     /// @param n_trg  number of points to evaluate.
-    BAOBZI_FLATTEN void operator()(const value_type *xp, value_type *res, std::size_t n_trg) const {
+    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res, std::size_t n_trg) const -> void {
         if (n_trg == 0) [[unlikely]] return;
         if (n_trg == 1) [[unlikely]] {
             const detail::Value<value_type, input_dim> xi(xp);
@@ -369,9 +369,9 @@ class Function {
         constexpr std::size_t kSortThreshold = 32;
         if (n_trg < kSortThreshold) {
             for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
-                const detail::Value<value_type, input_dim> xi(xp + input_dim * i_trg);
+                const detail::Value<value_type, input_dim> xi(xp + (input_dim * i_trg));
                 const detail::Value<value_type, output_dim> tmp = (*this)(xi);
-                std::copy(tmp.begin(), tmp.end(), res + i_trg * output_dim);
+                std::copy(tmp.begin(), tmp.end(), res + (i_trg * output_dim));
             }
             return;
         }
@@ -387,8 +387,8 @@ class Function {
         if (n_trg > tile_K) {
             for (std::size_t tile_off = 0; tile_off < n_trg; tile_off += tile_K) {
                 const std::size_t tile_n = std::min(tile_K, n_trg - tile_off);
-                eval_batch_tile(xp + input_dim * tile_off,
-                                res + output_dim * tile_off, tile_n);
+                eval_batch_tile(xp + (input_dim * tile_off),
+                                res + (output_dim * tile_off), tile_n);
             }
             return;
         }
@@ -427,14 +427,14 @@ class Function {
     /// `res` must hold `n * output_dim` elements. Restricted to
     /// `input_dim == 1`: 2D/3D leaf-id sequences are not monotone under
     /// single-axis sorting so the same trick does not apply.
-    BAOBZI_FLATTEN void operator()(const value_type *xp, value_type *res,
-                                   std::size_t n, sorted_t) const
+    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res,
+                                   std::size_t n, sorted_t) const -> void
         requires (input_dim == 1)
     {
         if (n == 0) [[unlikely]] return;
 
         constexpr value_type nan_v = std::numeric_limits<value_type>::quiet_NaN();
-        auto write_nan = [&](std::size_t i) {
+        auto write_nan = [&](std::size_t i) -> void {
             for (std::size_t j = 0; j < output_dim; ++j)
                 res[i * output_dim + j] = nan_v;
         };
@@ -486,8 +486,8 @@ class Function {
     /// `counts`/`offsets`, `perm`, `xp_packed`, `out_packed`) live in
     /// `thread_local` storage and are reused across calls — steady-state
     /// eval does no heap allocation.
-    void eval_batch_tile(const value_type *xp, value_type *res,
-                         std::size_t n_trg) const {
+    auto eval_batch_tile(const value_type *xp, value_type *res,
+                         std::size_t n_trg) const -> void {
         const auto n_leaves = static_cast<std::uint32_t>(polyfits_.size());
         const std::uint32_t ood_id = n_leaves; // sentinel bucket for out-of-domain
 
@@ -522,21 +522,21 @@ class Function {
         // Function domain — OOD detection collapses into the same
         // unsigned-wrap test that produces the table index, dropping
         // the Function-level OOD pre-check and get_linear_bin entirely.
-        auto find_loop = [&](auto &leaf_ids_vec) {
+        auto find_loop = [&](auto &leaf_ids_vec) -> void {
             using LeafIdT = std::remove_reference_t<decltype(leaf_ids_vec[0])>;
             if (subtrees_.size() == 1 && subtrees_.front().has_leaf_table()) {
                 const auto &st = subtrees_.front();
                 for (std::size_t i = 0; i < n_trg; ++i) {
-                    const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
+                    const detail::Value<value_type, input_dim> xi(xp + (input_dim * i));
                     const std::uint32_t id = st.find_leaf_id_with_ood(xi, ood_id);
                     leaf_ids_vec[i] = static_cast<LeafIdT>(id);
                     ++counts[id];
                 }
             } else {
                 for (std::size_t i = 0; i < n_trg; ++i) {
-                    const detail::Value<value_type, input_dim> xi(xp + input_dim * i);
+                    const detail::Value<value_type, input_dim> xi(xp + (input_dim * i));
                     bool in_domain = true;
-                    poet::static_for<input_dim>([&](auto D) {
+                    poet::static_for<input_dim>([&](auto D) -> void {
                         constexpr std::size_t d = D;
                         if (xi[d] < lower_left_[d] || xi[d] >= upper_right_[d])
                             in_domain = false;
@@ -564,7 +564,7 @@ class Function {
 
         // Scatter inputs to packed layout. offsets[] is consumed as a cursor;
         // rebuilt from counts afterwards for the per-leaf dispatch.
-        auto scatter_loop = [&](const auto &leaf_ids_vec) {
+        auto scatter_loop = [&](const auto &leaf_ids_vec) -> void {
             for (std::size_t i = 0; i < n_trg; ++i) {
                 const std::uint32_t id = leaf_ids_vec[i];
                 const std::uint32_t dst = offsets[id]++;
@@ -572,9 +572,9 @@ class Function {
                 if constexpr (input_dim == 1) {
                     xp_packed[dst] = xp[i];
                 } else {
-                    const value_type *src = xp + input_dim * i;
-                    value_type *dstp = xp_packed.data() + input_dim * dst;
-                    poet::static_for<input_dim>([&](auto D) {
+                    const value_type *src = xp + (input_dim * i);
+                    value_type *dstp = xp_packed.data() + (input_dim * dst);
+                    poet::static_for<input_dim>([&](auto D) -> void {
                         constexpr std::size_t d = D;
                         dstp[d] = src[d];
                     });
@@ -616,9 +616,9 @@ class Function {
                 using CI = typename poly_eval_type::CanonicalInput;
                 using CO = typename poly_eval_type::CanonicalOutput;
                 const CI *pts = reinterpret_cast<const CI *>(
-                    xp_packed.data() + input_dim * off);
+                    xp_packed.data() + (input_dim * off));
                 CO *outs = reinterpret_cast<CO *>(
-                    out_packed.data() + output_dim * off);
+                    out_packed.data() + (output_dim * off));
                 polyfits_[id](pts, outs, static_cast<std::size_t>(cnt));
             } else {
                 polyfits_[id](xp_packed.data() + off,
@@ -646,13 +646,13 @@ class Function {
 #if defined(__GNUC__) || defined(__clang__)
             if (dst + LOOKAHEAD < n_trg) {
                 const std::uint32_t s = perm[dst + LOOKAHEAD];
-                __builtin_prefetch(res + output_dim * s, /*rw=*/1, /*locality=*/0);
+                __builtin_prefetch(res + (output_dim * s), /*rw=*/1, /*locality=*/0);
             }
 #endif
             const std::uint32_t src = perm[dst];
-            const value_type *srcp = out_packed.data() + output_dim * dst;
-            value_type *dstp = res + output_dim * src;
-            poet::static_for<output_dim>([&](auto J) {
+            const value_type *srcp = out_packed.data() + (output_dim * dst);
+            value_type *dstp = res + (output_dim * src);
+            poet::static_for<output_dim>([&](auto J) -> void {
                 constexpr std::size_t j = J;
                 dstp[j] = srcp[j];
             });
@@ -660,11 +660,11 @@ class Function {
     }
 
     /// Point evaluation. Returns NaN for out-of-domain inputs.
-    [[nodiscard]] output_type operator()(const input_type &x) const {
+    [[nodiscard]] auto operator()(const input_type &x) const -> output_type {
         bool ood = false;
-        poet::static_for<input_dim>([&](auto D) {
+        poet::static_for<input_dim>([&](auto D) -> void {
             constexpr std::size_t d = D;
-            const value_type xd = [&] {
+            const value_type xd = [&]() -> value_type {
                 if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) return x[d];
                 else return x;
             }();
@@ -678,11 +678,11 @@ class Function {
     /// Panels where adaptive paneling failed at `max_depth`. Always empty
     /// unless `options.allow_max_depth_leaves == true` was set; the default
     /// path throws `MaxDepthExceeded` (which carries the same list) instead.
-    [[nodiscard]] const std::vector<NonConvergedPanel> &non_converged_panels() const {
+    [[nodiscard]] auto non_converged_panels() const -> const std::vector<NonConvergedPanel> & {
         return non_converged_panels_;
     }
 
-    [[nodiscard]] std::pair<dim_array_t, dim_array_t> get_bounds() const {
+    [[nodiscard]] auto get_bounds() const -> std::pair<dim_array_t, dim_array_t> {
         return std::make_pair(lower_left_, upper_right_);
     }
 

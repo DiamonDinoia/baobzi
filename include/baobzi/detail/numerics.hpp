@@ -20,7 +20,7 @@ using index_t = std::size_t; ///< Type specifying indexing into flattened tree.
 /// place of `std::pow` for ND fan-out counts (e.g. `Degree ** input_dim`)
 /// where the exponent is a compile-time constant.
 template <int EXP, typename T>
-constexpr T powi(T base) {
+constexpr auto powi(T base) -> T {
     if constexpr (EXP == 0) {
         return T{1};
     } else if constexpr (EXP % 2 == 0) {
@@ -36,7 +36,7 @@ constexpr T powi(T base) {
 /// as a function template to keep `std::tuple_size_v<T>` out of the
 /// instantiation when `T` is a scalar.
 template <typename T>
-constexpr std::size_t value_dim() {
+constexpr auto value_dim() -> std::size_t {
     if constexpr (poly_eval::detail::hasTupleSize_v<T>)
         return std::tuple_size_v<T>;
     else
@@ -60,8 +60,8 @@ struct Box {
 /// is read off the first/last Chebyshev coefficients, which generalise
 /// poorly to ND. Sample-based kinds dispatch to `sample_error_below_tolerance`.
 template <class Polyfit>
-bool tail_error_below_tolerance(TolKind tol_type, double tol,
-                                       const Polyfit &polyfit) {
+auto tail_error_below_tolerance(TolKind tol_type, double tol,
+                                const Polyfit &polyfit) -> bool {
     constexpr std::size_t input_dim  = value_dim_v<typename Polyfit::InputType>;
     constexpr std::size_t output_dim = value_dim_v<typename Polyfit::OutputType>;
     using T = poly_eval::detail::value_type_or_t<typename Polyfit::InputType>;
@@ -93,10 +93,10 @@ bool tail_error_below_tolerance(TolKind tol_type, double tol,
 /// `n_sample_1d`-per-axis grid exceeds `tol`. The chosen `tol_type`
 /// selects between max-abs vs. L2 and relative vs. absolute.
 template <class Func, class Polyfit>
-inline bool sample_error_below_tolerance(int n_sample_1d, TolKind tol_type, double tol,
+inline auto sample_error_below_tolerance(int n_sample_1d, TolKind tol_type, double tol,
                                          const typename Polyfit::InputType &center_in,
                                          const typename Polyfit::InputType &half_length_in,
-                                         const Func &func, const Polyfit &polyfit) {
+                                         const Func &func, const Polyfit &polyfit) -> bool {
     constexpr std::size_t input_dim  = value_dim_v<typename Polyfit::InputType>;
     constexpr std::size_t output_dim = value_dim_v<typename Polyfit::OutputType>;
     const auto n_sample_1d_sz = static_cast<std::size_t>(n_sample_1d);

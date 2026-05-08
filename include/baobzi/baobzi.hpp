@@ -100,8 +100,8 @@ namespace detail {
 // beat it on other widths. Revisit with the timing harness.
 inline constexpr std::size_t kDefaultDegree = 8;
 
-inline TreeInput make_input(int input_dim, int output_dim, int degree,
-                            double tol, const options &opts) {
+inline auto make_input(int input_dim, int output_dim, int degree,
+                       double tol, const options &opts) -> TreeInput {
     TreeInput in{};
     in.input_dim              = input_dim;
     in.output_dim             = output_dim;
@@ -115,7 +115,7 @@ inline TreeInput make_input(int input_dim, int output_dim, int degree,
 }
 
 template <class Domain>
-inline Domain midpoint(const Domain &a, const Domain &b) {
+inline auto midpoint(const Domain &a, const Domain &b) -> Domain {
     if constexpr (std::is_arithmetic_v<Domain>) {
         return static_cast<Domain>(0.5 * (a + b));
     } else {
@@ -127,7 +127,7 @@ inline Domain midpoint(const Domain &a, const Domain &b) {
 }
 
 template <class Domain>
-inline Domain half_length(const Domain &a, const Domain &b) {
+inline auto half_length(const Domain &a, const Domain &b) -> Domain {
     if constexpr (std::is_arithmetic_v<Domain>) {
         return static_cast<Domain>(0.5 * (b - a));
     } else {
@@ -139,7 +139,7 @@ inline Domain half_length(const Domain &a, const Domain &b) {
 }
 
 template <class Domain>
-constexpr int domain_dim() {
+constexpr auto domain_dim() -> int {
     if constexpr (std::is_arithmetic_v<Domain>)
         return 1;
     else

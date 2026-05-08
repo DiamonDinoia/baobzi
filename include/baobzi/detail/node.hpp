@@ -41,16 +41,16 @@ class Node {
 
     Node() = default;
 
-    [[nodiscard]] bool is_leaf() const { return first_child_idx == kLeafSentinel; }
+    [[nodiscard]] auto is_leaf() const -> bool { return first_child_idx == kLeafSentinel; }
 
     /// Fit this node to the requested tolerance. On success, stores the
     /// poly_eval_id into polyfits and returns true. Center/half_length are
     /// passed in (the runtime Node no longer carries `center`).
-    bool fit(const TreeInput &input, const Func &func,
+    auto fit(const TreeInput &input, const Func &func,
              const Value<value_type, input_dim> &center,
              const Value<value_type, input_dim> &half_length,
              const std::vector<value_type> &samples,
-             std::vector<poly_eval_type> &polyfits) {
+             std::vector<poly_eval_type> &polyfits) -> bool {
         if (!samples.empty())
             throw std::runtime_error("Baobzi fit error: sample points not yet supported");
 
@@ -58,7 +58,7 @@ class Node {
         const input_type lb = center - half_length;
         const input_type ub = center + half_length;
 
-        auto rollback_and_fail = [&polyfits, n_polyfit_before]() {
+        auto rollback_and_fail = [&polyfits, n_polyfit_before]() -> bool {
             while (polyfits.size() != n_polyfit_before)
                 polyfits.pop_back();
             return false;
@@ -91,7 +91,7 @@ class Node {
         poly_eval_id = static_cast<std::uint32_t>(polyfits.size() - 1);
     }
 
-    [[nodiscard]] std::size_t memory_usage() const { return sizeof(*this); }
+    [[nodiscard]] auto memory_usage() const -> std::size_t { return sizeof(*this); }
 };
 
 // Lock the 8-B node invariant. If this fires, an extra field was added
@@ -99,13 +99,13 @@ class Node {
 // cache line.
 namespace detail_node_size_check {
 struct ScalarFn {
-    double operator()(double) const { return 0.0; }
+    auto operator()(double) const -> double { return 0.0; }
 };
 struct Array2Fn {
-    std::array<double, 1> operator()(std::array<double, 2>) const { return {0.0}; }
+    auto operator()(std::array<double, 2>) const -> std::array<double, 1> { return {0.0}; }
 };
 struct Array3Fn {
-    std::array<double, 1> operator()(std::array<double, 3>) const { return {0.0}; }
+    auto operator()(std::array<double, 3>) const -> std::array<double, 1> { return {0.0}; }
 };
 static_assert(sizeof(Node<ScalarFn, 8>) == 8, "slim Node expected to be 8 B (1D)");
 static_assert(sizeof(Node<Array2Fn, 8>) == 8, "slim Node expected to be 8 B (2D)");
