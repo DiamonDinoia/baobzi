@@ -29,9 +29,12 @@ endif()
 include(GNUInstallDirs)
 include(CheckIPOSupported)
 check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
-if(_ipo_supported)
+# gcc 14's LTO chokes (ICE / "invalid tree code") on the heavy template
+# instantiations in the timing examples. Skip IPO on gcc until that's
+# fixed upstream — clang's LTO handles the same code without trouble.
+if(_ipo_supported AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-else()
+elseif(NOT _ipo_supported)
   message(WARNING "IPO is not supported: ${_ipo_error}")
 endif()
 
@@ -46,13 +49,37 @@ endif()
 # Override at configure time with `-DBAOBZI_ARCH=...` to target a portable
 # baseline (e.g. `x86-64-v3` for AVX2+FMA without per-machine tuning).
 set(BAOBZI_ARCH "native" CACHE STRING
-    "CPU target for -march/-mtune (e.g. native, x86-64-v3)")
-add_compile_options(-march=${BAOBZI_ARCH} -mtune=${BAOBZI_ARCH}
-                    -funroll-loops -funsafe-math-optimizations
-                    -ffp-contract=fast)
-add_link_options(-march=${BAOBZI_ARCH} -mtune=${BAOBZI_ARCH}
-                 -funroll-loops -funsafe-math-optimizations
-                 -ffp-contract=fast)
+    "CPU target for -march (e.g. native, x86-64-v3)")
+# gcc rejects `-mtune=x86-64-v{2,3,4}` (only `-march=` accepts those microarch
+# levels), so we derive a tune value: pass through anything else, but fall
+# back to `generic` for the x86-64-v* baselines.
+if(BAOBZI_ARCH MATCHES "^x86-64-v[0-9]+$")
+    set(_baobzi_tune "generic")
+else()
+    set(_baobzi_tune "${BAOBZI_ARCH}")
+endif()
+set(BAOBZI_TUNE "${_baobzi_tune}" CACHE STRING
+    "CPU target for -mtune (defaults to BAOBZI_ARCH, or generic for x86-64-v*)")
+# Apple clang on AArch64 rejects `-march=apple-*` / `-mtune=` — it expects
+# `-mcpu=` for that microarch family. Use the right spelling per platform.
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    set(_baobzi_arch_flags -mcpu=${BAOBZI_ARCH})
+else()
+    set(_baobzi_arch_flags -march=${BAOBZI_ARCH} -mtune=${BAOBZI_TUNE})
+endif()
+# Global compile flags. We deliberately stay conservative here:
+#   - Arch flags are needed for FMA codegen at all.
+#   - `-ffp-contract=fast` permits FMA contraction (a single `fma` is
+#     *more* accurate than a separate mul+add, so it is monotonic for
+#     fit accuracy).
+# We do *not* enable `-funroll-loops` or `-funsafe-math-optimizations`
+# globally: the eval hot path already unrolls the per-axis loops via
+# `poet::static_for` (compile-time unrolling, no need for the optimiser
+# to guess), and the Horner kernel is written so reassociation would
+# only hurt accuracy. Enabling them would also reorder the FP arithmetic
+# in the fit's convergence test and flip outcomes on borderline panels.
+add_compile_options(${_baobzi_arch_flags} -ffp-contract=fast)
+add_link_options(${_baobzi_arch_flags} -ffp-contract=fast)
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 

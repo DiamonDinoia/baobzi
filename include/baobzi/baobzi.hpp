@@ -13,6 +13,24 @@
 /// mutates shared state. Baobzi does not parallelize internally — callers
 /// chunk their inputs and spawn threads themselves; this contract makes that
 /// pattern safe. See `tests/test_threadsafe.cpp`.
+///
+/// Memory cost of fit-time knobs. Tightening `tol`, raising `max_depth`,
+/// raising `max_memory_mib`, or enabling `allow_max_depth_leaves` all
+/// increase the leaf count `L`. Two memory budgets scale with `L`:
+///   - **Persistent tree** (one copy, shared by all threads): `O(L)`.
+///     Reported by `Function::print_stats()` / `memory_usage()`.
+///   - **Per-thread eval scratch** (lazy, thread_local, allocated on the
+///     first batch call): the batch path tiles at
+///     `tile_K = max(65536, 32 * L)`, and each tile holds packed input,
+///     packed output, leaf-id, perm, count, and offset buffers. So the
+///     per-thread footprint is roughly
+///     `tile_K * (8 + (input_dim + output_dim) * sizeof(value_type))` plus
+///     `8 * (L + 1)` bytes, multiplied by `(threads × distinct Function
+///     template instantiations touched)`. The vectors never shrink. For
+///     smooth functions `L` stays in the hundreds and the scratch is
+///     ~1–3 MiB; for `L = 10^5` it is ~80 MiB per thread; for `L = 10^6`
+///     it is ~800 MiB per thread. `print_stats()` reports a worst-case
+///     estimate so the cost is visible at fit time.
 
 #include <array>
 #include <concepts>
@@ -55,14 +73,16 @@ struct options {
     /// 50 is far above what any non-singular function needs; lower it
     /// to fail fast when a near-singularity is suspected.
     int     max_depth = 50;
-    /// Soft cap on accumulated leaf storage during the fit, in MiB.
+    /// Hard cap on accumulated leaf storage during the fit, in MiB.
     /// `MemoryBudgetExceeded` is thrown when crossed; set to `0` to
-    /// disable. 64 MiB sits below typical LLCs (Sapphire Rapids
-    /// ~60 MB, Zen4 ~96 MB shared, M1-class ~24–48 MB) so the
-    /// evaluator stays cache-resident alongside the caller's working
-    /// set. Raise for ambitious 3D+ fits — the exception carries the
-    /// offending panel so the caller can locate the singular region.
-    int     max_memory_mib = 64;
+    /// disable. The default (4 MiB) is intentionally strict: it keeps
+    /// the evaluator inside L2 on most cores and forces callers to
+    /// opt in explicitly before letting an adaptive paneler grow into
+    /// memory regions that should raise eyebrows. Raise for ambitious
+    /// 3D+ fits — the exception carries the offending panel so the
+    /// caller can locate the singular region — or set to `0` to
+    /// disable the check entirely.
+    int     max_memory_mib = 4;
     /// When true, panels that fail tolerance at `max_depth` are kept
     /// as best-effort leaves. Inspect them via
     /// `Function::non_converged_panels()`. Default false (throw, with

@@ -218,7 +218,10 @@ TEST_CASE("Oscillatory sin(k r)/r in 3D", "[baobzi][greens][oscillatory][3d]") {
         };
         std::array<double, 3> a{0.2, 0.2, 0.2};
         std::array<double, 3> b{1.5, 1.5, 1.5};
-        auto fn = fit(f, a, b, kTol);
+        // 3D oscillatory near-singular fit refines aggressively; opt in
+        // to a generous budget rather than the strict 4 MiB default.
+        auto fn = fit(f, a, b, kTol,
+                      baobzi::options{.max_memory_mib = 64});
         auto ap = [&](std::array<double, 3> x) { return fn(x)[0]; };
         REQUIRE(max_rel_err_nd<3>(ex, ap, {0.21, 0.21, 0.21},
                                   {1.49, 1.49, 1.49}, 1000, 9) < 500 * kTol);

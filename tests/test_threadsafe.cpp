@@ -109,7 +109,7 @@ void run_threadsafe_check(Fn &fn,
 
 } // namespace
 
-TEST_CASE("operator() is thread-safe — 2d_bump deg=8", "[baobzi][threadsafe]") {
+TEST_CASE("operator() is thread-safe -- 2d_bump deg=8", "[baobzi][threadsafe]") {
     auto fn = baobzi::fit<8>(make_bump2d(),
                              std::array<double, 2>{0.0, 0.0},
                              std::array<double, 2>{1.0, 1.0}, 1e-10);
@@ -119,7 +119,7 @@ TEST_CASE("operator() is thread-safe — 2d_bump deg=8", "[baobzi][threadsafe]")
     run_threadsafe_check<2>(fn, xp, res_ref);
 }
 
-TEST_CASE("operator() is thread-safe — 3d_gauss deg=8", "[baobzi][threadsafe]") {
+TEST_CASE("operator() is thread-safe -- 3d_gauss deg=8", "[baobzi][threadsafe]") {
     auto fn = baobzi::fit<8>(make_gauss3d(),
                              std::array<double, 3>{-1.0, -1.0, -1.0},
                              std::array<double, 3>{1.0, 1.0, 1.0}, 1e-10);

@@ -47,7 +47,7 @@ double max_rel_err_2d(F1 &&exact, F2 &&approx,
 }
 } // namespace
 
-TEST_CASE("1D smooth sin on [0, 2π], compile-time degree 8", "[baobzi][smooth]") {
+TEST_CASE("1D smooth sin on [0, 2pi], compile-time degree 8", "[baobzi][smooth]") {
     auto f = [](double x) { return std::sin(5.0 * x); };
     const double a = 0.0;
     const double b = 2.0 * std::numbers::pi_v<double>;
@@ -188,7 +188,7 @@ TEST_CASE("2D anisotropic gaussian bump", "[baobzi][2d][bump]") {
                            {0.001, 0.001}, {0.999, 0.999}, 5000) < 1e-6);
 }
 
-TEST_CASE("sqrt|x - 0.5| — not C^1, max_depth guards runaway",
+TEST_CASE("sqrt|x - 0.5| -- not C^1, max_depth guards runaway",
           "[baobzi][sharp]") {
     auto f = [](double x) { return std::sqrt(std::abs(x - 0.5)); };
     // Low max_depth — the fit will hit the ceiling at the singularity.
@@ -197,11 +197,13 @@ TEST_CASE("sqrt|x - 0.5| — not C^1, max_depth guards runaway",
                options{.tol_kind = baobzi::TolKind::AbsoluteMax,
                        .max_depth = 4}),
         baobzi::MaxDepthExceeded);
-    // Generous max_depth — should succeed and meet a loose tolerance away
-    // from the singularity.
+    // Generous max_depth + accept best-effort leaves at the singular panel
+    // — `sqrt|x-0.5|` is not C^1 at 0.5, so that panel will never reach
+    // tol=1e-10. We only need the rest of the domain to be usable.
     auto fn = fit<10>(f, 0.0, 1.0, /*tol=*/1e-10,
                       options{.tol_kind = baobzi::TolKind::AbsoluteMax,
-                              .max_depth = 50});
+                              .max_depth = 50,
+                              .allow_max_depth_leaves = true});
     // Sample away from the non-smooth point.
     std::mt19937 gen(5);
     std::uniform_real_distribution<double> d(0.0, 0.45);
@@ -299,7 +301,7 @@ TEST_CASE("Sorted-1D batch matches unsorted batch and scalar", "[baobzi][batch][
     }
 }
 
-TEST_CASE("Batch vs single evaluation agree — 2D vector output", "[baobzi][batch][2d]") {
+TEST_CASE("Batch vs single evaluation agree -- 2D vector output", "[baobzi][batch][2d]") {
     auto f = [](std::array<double, 2> x) -> std::array<double, 2> {
         return {std::sin(x[0] + x[1]), std::cos(x[0] - x[1])};
     };
@@ -329,7 +331,7 @@ TEST_CASE("Batch vs single evaluation agree — 2D vector output", "[baobzi][bat
     }
 }
 
-TEST_CASE("Batch vs single evaluation agree — 3D scalar output", "[baobzi][batch][3d]") {
+TEST_CASE("Batch vs single evaluation agree -- 3D scalar output", "[baobzi][batch][3d]") {
     auto f = [](std::array<double, 3> x) -> std::array<double, 1> {
         return {std::exp(-x[0] * x[0] - x[1] * x[1] - x[2] * x[2])};
     };
@@ -441,6 +443,82 @@ TEST_CASE("allow_max_depth_leaves accepts unconverged panels",
                              .allow_max_depth_leaves = true});
     REQUIRE_FALSE(fn.non_converged_panels().empty());
     REQUIRE(std::isfinite(fn(0.5)));
+}
+
+TEST_CASE("1D smooth fit on large symmetric domain [-1e6, 1e6]",
+          "[baobzi][large-domain]") {
+    // Slow oscillation so the tree stays shallow even on a wide domain.
+    // Verifies that adaptive subdivision and OOD checks behave correctly
+    // when |x| dwarfs the unit interval the evaluator's algebra is
+    // typically validated on.
+    const double a = -1.0e6;
+    const double b =  1.0e6;
+    auto f = [](double x) { return std::sin(1e-5 * x) + 0.25 * std::cos(3e-6 * x); };
+
+    auto fn = fit<8>(f, a, b, /*tol=*/1e-9);
+    REQUIRE(max_rel_err_1d(f, fn, a + 1.0, b - 1.0, N_SAMPLE) < 1e-7);
+    // OOD on the wide domain still NaNs cleanly.
+    REQUIRE(std::isnan(fn(a - 1.0)));
+    REQUIRE(std::isnan(fn(b + 1.0)));
+}
+
+TEST_CASE("1D smooth fit on far-shifted domain centred at 1e6",
+          "[baobzi][large-domain][shifted]") {
+    // The action lives in a unit-width interval translated by 1e6. This
+    // catches places where the implementation accidentally relies on the
+    // domain being centred near zero (e.g. computing `b - a` losing
+    // precision, or assuming small magnitudes of `x` in the leaf-table
+    // quantize). The shift consumes ~6 digits of relative input
+    // precision, so the achievable tolerance and the verification
+    // tolerance reflect that floor.
+    const double centre = 1.0e6;
+    const double a = centre;
+    const double b = centre + 1.0;
+    auto f = [centre](double x) { return std::sin(5.0 * (x - centre)); };
+
+    auto fn = fit<8>(f, a, b, /*tol=*/1e-8);
+    REQUIRE(max_rel_err_1d(f, fn, a + 1e-6, b - 1e-6, N_SAMPLE) < 1e-5);
+}
+
+TEST_CASE("2D smooth fit on large asymmetric domain", "[baobzi][large-domain][2d]") {
+    // Wide non-square box with mismatched per-axis scales — exercises the
+    // anisotropic-domain top-level paneling.
+    auto f = [](std::array<double, 2> x) -> std::array<double, 1> {
+        return {std::sin(1e-3 * x[0]) * std::cos(1e-2 * x[1])};
+    };
+    auto exact = [](std::array<double, 2> x) {
+        return std::sin(1e-3 * x[0]) * std::cos(1e-2 * x[1]);
+    };
+    std::array<double, 2> a{-1.0e3, -1.0e2};
+    std::array<double, 2> b{ 1.0e3,  1.0e2};
+
+    auto fn = fit<8>(f, a, b, /*tol=*/1e-9);
+    auto approx = [&](std::array<double, 2> x) { return fn(x)[0]; };
+    REQUIRE(max_rel_err_2d(exact, approx, a, b, 2000) < 1e-7);
+}
+
+TEST_CASE("Default 4 MiB memory budget caps runaway fits -- opt-in to raise",
+          "[baobzi][memory-budget][default]") {
+    // A tight fit on a near-singular Yukawa-like 3D function bursts the
+    // default 4 MiB cap, surfacing the budget guard. Opting in to a larger
+    // budget completes the same fit. This pins the new default so that
+    // unintentional tree blow-ups always throw rather than silently
+    // exhausting memory.
+    auto f = [](std::array<double, 3> x) -> std::array<double, 1> {
+        const double r = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        return {std::exp(-r) / r};
+    };
+    REQUIRE_THROWS_AS(
+        fit<8>(f, std::array{0.05, 0.05, 0.05}, std::array{1.5, 1.5, 1.5},
+               /*tol=*/1e-10,
+               options{.tol_kind = baobzi::TolKind::AbsoluteMax}),
+        baobzi::MemoryBudgetExceeded);
+    // Same fit succeeds with an explicit, larger budget — the opt-in path.
+    auto fn = fit<8>(f, std::array{0.05, 0.05, 0.05}, std::array{1.5, 1.5, 1.5},
+                     /*tol=*/1e-10,
+                     options{.tol_kind = baobzi::TolKind::AbsoluteMax,
+                             .max_memory_mib = 256});
+    REQUIRE(std::isfinite(fn(std::array{1.0, 1.0, 1.0})[0]));
 }
 
 TEST_CASE("Batch handles out-of-domain points as NaN", "[baobzi][batch][ood]") {

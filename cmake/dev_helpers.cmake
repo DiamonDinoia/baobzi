@@ -138,6 +138,11 @@ function(baobzi_enable_warnings target)
     /w14905
     /w14906
     /w14928
+    # MSVC's C4702 ("unreachable code") fires inside heavily-templated
+    # `if constexpr` ladders in polyfit / poet / our numerics — it's a
+    # known false-positive class with no clean source-level fix. Disable
+    # it explicitly so /WX doesn't reject those harmless paths.
+    /wd4702
   )
 
   # Build compiler-specific warning flags using generator expressions

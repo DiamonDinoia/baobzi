@@ -1,0 +1,27 @@
+Checks: "*,
+        -abseil-*,
+        -altera-*,
+        -android-*,
+        -fuchsia-*,
+        -google-*,
+        -llvm*,
+        -zircon-*,
+        -boost-use-ranges,
+        -cppcoreguidelines-avoid-magic-numbers,
+        -readability-magic-numbers,
+        -portability-avoid-pragma-once,
+        -cppcoreguidelines-avoid-const-or-ref-data-members"
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '^${PROJECT_SOURCE_DIR}/(include|src|tests)'
+FormatStyle:     none
+
+CheckOptions:
+  - key: readability-identifier-length.IgnoredVariableNames
+    value: 'x|y|z|i|j|k|n|t|d|f|a|b|h'
+  - key: readability-identifier-length.IgnoredParameterNames
+    value: 'x|y|z|i|j|k|n|t|d|f|a|b|h'
+  - key: modernize-use-auto.MinTypeNameLength
+    value: '5'
+  - key: modernize-use-auto.RemoveStars
+    value: 'true'
