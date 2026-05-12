@@ -11,6 +11,7 @@
 #include <polyfit/polyfit.hpp>
 
 #include <baobzi/detail/compiler_macros.hpp>
+#include <baobzi/detail/eval_policy.hpp>
 #include <baobzi/detail/numerics.hpp>
 #include <baobzi/detail/tol_kind.hpp>
 #include <baobzi/detail/value.hpp>
@@ -23,16 +24,13 @@ namespace baobzi::detail {
 /// `poly_eval_id` indexes the per-Function polyfits table and is meaningful
 /// only on leaves. 8 nodes per cache line in every dim — descent loads few
 /// cachelines.
-template <class Func, std::size_t Degree>
+template <class Func, std::size_t Degree, EvalPolicy Policy = EvalPolicy::Balanced>
 class Node {
   public:
     using input_type = std::remove_cvref_t<poly_eval::fitInput_t<Func>>;
     using output_type = poly_eval::fitOutput_t<Func>;
     using value_type = poly_eval::detail::value_type_or_t<input_type>;
-    using poly_eval_type = std::conditional_t<
-        poly_eval::detail::hasTupleSize_v<input_type>,
-        poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>,
-        poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>>;
+    using poly_eval_type = poly_eval_type_for<Func, Degree, Policy>;
 
     static constexpr std::size_t input_dim = value_dim_v<input_type>;
     static constexpr std::size_t output_dim = value_dim_v<output_type>;

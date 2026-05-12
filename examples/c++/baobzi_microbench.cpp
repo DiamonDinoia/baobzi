@@ -95,14 +95,34 @@ ankerl::nanobench::Bench make_bench(std::size_t n_pts) {
     return b;
 }
 
+#ifndef BAOBZI_BENCH_POLICY
+#define BAOBZI_BENCH_POLICY ::baobzi::EvalPolicy::Balanced
+#endif
+
 template <std::size_t Deg, class Fmaker>
 void sweep_1d(ankerl::nanobench::Bench &b, const char *label, Fmaker make_f,
               double a, double b_) {
     auto f = make_f();
-    auto fn = baobzi::fit<Deg>(f, a, b_, /*tol=*/1e-10);
+    baobzi::options opts;
+    opts.max_memory_mib = 0; // disable fit-time leaf-storage budget for bench
+    auto fn = baobzi::fit<Deg, BAOBZI_BENCH_POLICY>(f, a, b_, /*tol=*/1e-10, opts);
     std::mt19937 gen(7);
     std::uniform_real_distribution<double> d(a + 1e-3, b_ - 1e-3);
 
+    // True single-point scalar: exercises Function::operator()(x) → polyfits_[id](x),
+    // i.e. the polyfit scalar kernel that EvalPolicy::Latency targets.
+    {
+        std::vector<double> xs(1024);
+        for (auto &x : xs) x = d(gen);
+        std::string name = std::string(label) + " deg=" + std::to_string(Deg) +
+                           " dim=1 scalar-op()";
+        b.batch(1.0);
+        b.run(name, [&] {
+            double acc = 0.0;
+            for (double x : xs) acc += fn(x);
+            ankerl::nanobench::doNotOptimizeAway(acc);
+        });
+    }
     for (std::size_t n_pts : {std::size_t(1), std::size_t(32),
                               std::size_t(1024), std::size_t(1'000'000)}) {
         std::vector<double> xs(n_pts);
@@ -123,13 +143,31 @@ template <std::size_t Deg, std::size_t Dim, class Fmaker>
 void sweep_nd(ankerl::nanobench::Bench &b, const char *label, Fmaker make_f,
               std::array<double, Dim> a, std::array<double, Dim> b_) {
     auto f = make_f();
-    auto fn = baobzi::fit<Deg>(f, a, b_, /*tol=*/1e-10);
+    baobzi::options opts;
+    opts.max_memory_mib = 0; // disable fit-time leaf-storage budget for bench
+    auto fn = baobzi::fit<Deg, BAOBZI_BENCH_POLICY>(f, a, b_, /*tol=*/1e-10, opts);
     std::mt19937 gen(7);
     std::uniform_real_distribution<double> ud(0.0, 1.0);
     auto pick = [&](std::size_t d) {
         return a[d] + (b_[d] - a[d] - 1e-3) * ud(gen) + 5e-4;
     };
 
+    // True single-point scalar: ND Function::operator()(const array&) path.
+    {
+        std::vector<std::array<double, Dim>> xs(1024);
+        for (auto &x : xs) for (std::size_t d = 0; d < Dim; ++d) x[d] = pick(d);
+        std::string name = std::string(label) + " deg=" + std::to_string(Deg) +
+                           " dim=" + std::to_string(Dim) + " scalar-op()";
+        b.batch(1.0);
+        b.run(name, [&] {
+            double acc = 0.0;
+            for (const auto &x : xs) {
+                auto y = fn(x);
+                acc += y[0];
+            }
+            ankerl::nanobench::doNotOptimizeAway(acc);
+        });
+    }
     for (std::size_t n_pts : {std::size_t(1), std::size_t(32),
                               std::size_t(1024), std::size_t(1'000'000)}) {
         std::vector<double> flat(Dim * n_pts);

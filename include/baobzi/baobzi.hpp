@@ -35,6 +35,8 @@
 
 #include <polyfit/polyfit.hpp>
 
+#include <baobzi/detail/eval_policy.hpp>
+
 namespace baobzi {
 
 /// Tag for `Function::operator()` overloads that promise the input is
@@ -145,7 +147,8 @@ constexpr auto domain_dim() -> int {
 /// of the adaptive tree; the leaf degree is a hyperparameter with a
 /// reasonable default. `tol` is positional (no default) so every call site
 /// makes its target accuracy explicit.
-template <std::size_t Degree = detail::kDefaultDegree, class Func, class Domain>
+template <std::size_t Degree = detail::kDefaultDegree,
+          EvalPolicy Policy = EvalPolicy::Balanced, class Func, class Domain>
     requires Fittable<Func, Domain>
 [[nodiscard]] auto fit(Func f, Domain a, Domain b, double tol, options opts = {}) {
     if (!(tol > 0.0))
@@ -158,8 +161,9 @@ template <std::size_t Degree = detail::kDefaultDegree, class Func, class Domain>
 
     auto input = detail::make_input(in_dim, out_dim, static_cast<int>(Degree),
                                     tol, opts);
-    return Function<Degree, Func>(input, detail::midpoint(a, b),
-                                  detail::half_length(a, b), std::move(f));
+    return Function<Degree, Func, Policy>(input, detail::midpoint(a, b),
+                                          detail::half_length(a, b),
+                                          std::move(f));
 }
 
 } // namespace baobzi

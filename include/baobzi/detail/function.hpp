@@ -23,6 +23,7 @@
 
 #include <baobzi/detail/compiler_macros.hpp>
 #include <baobzi/detail/errors.hpp>
+#include <baobzi/detail/eval_policy.hpp>
 #include <baobzi/detail/node.hpp>
 #include <baobzi/detail/numerics.hpp>
 #include <baobzi/detail/polytree.hpp>
@@ -38,23 +39,21 @@ struct sorted_t;  // Tag type — defined in <baobzi/baobzi.hpp>; passed by valu
 /// subtrees over a uniform top-level grid, each subtree built BFS to the
 /// requested tolerance. After construction the object is immutable and its
 /// evaluators are thread-safe — see header docstring on `baobzi/baobzi.hpp`.
-template <std::size_t Degree, class Func>
+template <std::size_t Degree, class Func, EvalPolicy Policy = EvalPolicy::Balanced>
 class Function {
   public:
     using input_type = std::remove_cvref_t<poly_eval::fitInput_t<Func>>;
     using output_type = poly_eval::fitOutput_t<Func>;
     using value_type = poly_eval::detail::value_type_or_t<input_type>;
-    using poly_eval_type = std::conditional_t<
-        poly_eval::detail::hasTupleSize_v<input_type>,
-        poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>,
-        poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>>;
+    using poly_eval_type = detail::poly_eval_type_for<Func, Degree, Policy>;
     static constexpr auto degree = Degree;
+    static constexpr auto policy = Policy;
 
     static constexpr std::size_t input_dim = detail::value_dim_v<input_type>;
     static constexpr std::size_t output_dim = detail::value_dim_v<output_type>;
     static constexpr std::size_t n_child = std::size_t{1} << input_dim;
 
-    using node_t = detail::Node<Func, Degree>;
+    using node_t = detail::Node<Func, Degree, Policy>;
     using box_t = detail::Box<value_type, input_dim>;
     using dim_array_t = detail::Value<value_type, input_dim>;
 
@@ -781,7 +780,7 @@ class Function {
     dim_array_t lower_left_{};
     dim_array_t upper_right_{};
 
-    std::vector<detail::PolyTree<Degree, Func>> subtrees_;
+    std::vector<detail::PolyTree<Degree, Func, Policy>> subtrees_;
     detail::Value<std::size_t, input_dim> n_subtrees_{};
     dim_array_t inv_bin_size_{};
 

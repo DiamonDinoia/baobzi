@@ -2717,3 +2717,71 @@ Likely sources of the win:
 
 iter-21 ships net positive on every hot-path cell. Next perf
 re-baselines against this state.
+
+## rev-2 Phase 0a — `EvalPolicy::Latency` remapped to Horner
+
+Date: 2026-05-12. Host: Meteor Lake (Core Ultra 7 155H,
+`taskset -c 2`). Baseline: `use-polyfit @ d1fc7f9` (`Latency →
+Hybrid + HybridK<optimal_block_size<Degree,1,NREG,Latency>>`,
+which resolves to `K=2` for Degree=8). Treatment: `Latency →
+Horner` (same scalar kernel as `Balanced`).
+
+Paired-interleaved, 14 runs, `baobzi_microbench` with the
+`scalar-op()` rows enabled. Δ% is `(Latency − Balanced) /
+Balanced × 100`; positive means `Latency` slower.
+
+### 1D scalar-op() — every scenario is a regression
+
+| Scenario              | paired-median Δ% |
+|-----------------------|------------------|
+| 1d_bessel_j0 deg=8    | **+10.45 %**     |
+| 1d_erf       deg=8    | **+16.43 %**     |
+| 1d_log1p     deg=8    | **+13.54 %**     |
+| 1d_runge     deg=6    |  +8.45 %         |
+| 1d_runge     deg=8    | **+32.54 %**     |
+| 1d_runge     deg=10   | **+27.49 %**     |
+| 1d_tanh_sharp deg=10  | **+14.19 %**     |
+
+7/7 1D scalar-op() scenarios regress between +8 % and +33 %. The
+Degree=8 runs straddle the polyfit heuristic's worst pick
+(`K=2`).
+
+### 2D / 3D scalar-op() — noise
+
+2D scalar-op() rows print Δ ∈ [−2.4 %, +3.5 %] (paired-median).
+3D scalar-op() rows print Δ ∈ [−1.5 %, +2.0 %]. Policy doesn't
+reach those code paths directly — the small drift is
+template-instantiation / inlining noise.
+
+### Batch paths — wash
+
+| N    | scenarios | paired-median Δ% | min     | max     |
+|------|-----------|------------------|---------|---------|
+| 1    | 17        | +0.28            | −9.49   | +8.36   |
+| 32   | 17        | −1.72            | −13.77  | +14.18  |
+| 1024 | 17        | −3.26            | −20.19  | +13.24  |
+| 1M   | 17        | −1.80            | −8.66   | +2.78   |
+
+`evalBatch` is hardwired to `horner` SIMD in polyfit upstream
+regardless of `ScalarKernel`. The small batch deltas are
+codegen-layout artefacts of swapping the scalar kernel
+instantiation, not kernel-level wins.
+
+### Conclusion
+
+`Latency = Hybrid(K=2)` is a measured 1D scalar-op() regression
+on Meteor Lake — exactly the failure mode the rev-1 closed-form
+`T(K) ≈ L_fma · (K + ⌈log2 B⌉)` model missed (it leaves out the
+`x^K` power chain, the combine-tree squaring, and the dependent
+FMA serialisation through the combine).
+
+Phase 0a remaps `scalar_kernel_for_policy_v<Latency>` to
+`Horner` and zeroes `hybrid_k_for_policy_v<Latency,_>`. After
+the remap all three policies route the scalar path through
+`ScalarKernel::Horner`; no policy ships a known regression.
+`Latency` is retained as a template tag for a future Hybrid
+mapping once a measured (Degree, microarch, K) cell beats
+Horner on the scalar path.
+
+Verification: 39/39 ctests pass on the Release build with the
+remap applied.

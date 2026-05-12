@@ -28,6 +28,15 @@ endif()
 # Tell CPM (used inside polyfit) to source xsimd from our local fork.
 set(CPM_xsimd_SOURCE "${_baobzi_xsimd_fork}" CACHE PATH "" FORCE)
 
+# Polyfit's `feat/parametric-block-size` branch extends the `estrin`-branch
+# ScalarKernel selector with an opt-in `HybridK<K>` block-size override plus
+# a consteval `optimal_block_size<NCOEFFS,SIMD_W,NREG,Policy>` picker and an
+# `EvalPolicy { Latency, Throughput, Balanced }` enum. Baobzi threads
+# `EvalPolicy` through `Function` and routes the scalar kernel and K choice
+# per policy (see include/baobzi/detail/eval_policy.hpp); today's default
+# `Balanced` keeps the scalar `Horner` mapping to avoid regressing the
+# 1.3-1.6x scalar slowdown reported on Core Ultra 7 at xsimd lane_w=4 until
+# the K-sweep measurement campaign retunes the formula.
 FetchContent_Declare(
     polyfit
     GIT_REPOSITORY https://github.com/DiamonDinoia/polyfit.git

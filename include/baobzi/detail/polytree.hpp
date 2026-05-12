@@ -14,6 +14,7 @@
 
 #include <baobzi/detail/compiler_macros.hpp>
 #include <baobzi/detail/errors.hpp>
+#include <baobzi/detail/eval_policy.hpp>
 #include <baobzi/detail/node.hpp>
 #include <baobzi/detail/numerics.hpp>
 #include <baobzi/detail/tol_kind.hpp>
@@ -24,21 +25,18 @@ namespace baobzi::detail {
 /// One BFS-built subtree: a flat node array plus an optional
 /// quantize→leaf table for shallow trees. The eval-time hot path
 /// (`get_node_index`, `find_leaf_id_with_ood`) lives here.
-template <std::size_t Degree, class Func>
+template <std::size_t Degree, class Func, EvalPolicy Policy = EvalPolicy::Balanced>
 struct PolyTree {
     using input_type = std::remove_cvref_t<poly_eval::fitInput_t<Func>>;
     using value_type = poly_eval::detail::value_type_or_t<input_type>;
-    using poly_eval_type = std::conditional_t<
-        poly_eval::detail::hasTupleSize_v<input_type>,
-        poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>,
-        poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>>;
+    using poly_eval_type = poly_eval_type_for<Func, Degree, Policy>;
     using output_type = poly_eval::fitOutput_t<Func>;
 
     static constexpr std::size_t output_dim = value_dim_v<output_type>;
     static constexpr std::size_t input_dim = value_dim_v<input_type>;
     static constexpr std::size_t n_child = std::size_t{1} << input_dim;
 
-    using node_t = Node<Func, Degree>;
+    using node_t = Node<Func, Degree, Policy>;
     using box_t = Box<value_type, input_dim>;
     using dim_array_t = Value<value_type, input_dim>;
 
