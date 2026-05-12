@@ -18,9 +18,9 @@ FormatStyle:     none
 
 CheckOptions:
   - key: readability-identifier-length.IgnoredVariableNames
-    value: 'x|y|z|i|j|k|n|t|d|f|a|b|h'
+    value: 'x|y|z|i|j|k|n|t|d|f|a|b|h|W|fid|st'
   - key: readability-identifier-length.IgnoredParameterNames
-    value: 'x|y|z|i|j|k|n|t|d|f|a|b|h'
+    value: 'x|y|z|i|j|k|n|t|d|f|a|b|h|W|fid|st'
   - key: modernize-use-auto.MinTypeNameLength
     value: '5'
   - key: modernize-use-auto.RemoveStars

@@ -15,6 +15,11 @@ function(_baobzi_add_cpp_test name source)
   target_link_libraries(${name} PRIVATE
     Catch2::Catch2WithMain polyfit::polyfit poet::poet)
   baobzi_enable_warnings(${name})
+  # Catch2's TEST_CASE expands to a use of __COUNTER__, which bleeding-edge
+  # clang flags as a C2y extension; the warning is harmless and out of our
+  # control (lives in Catch2 macros), so silence it on test targets only.
+  target_compile_options(${name} PRIVATE
+    $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:-Wno-c2y-extensions>)
   catch_discover_tests(${name})
 endfunction()
 

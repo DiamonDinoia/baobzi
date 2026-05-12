@@ -1,9 +1,14 @@
 #include <baobzi/baobzi.hpp>
+#include <baobzi/eval_scatter.hpp>
 
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <functional>
 #include <numbers>
 #include <random>
+#include <span>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
@@ -11,6 +16,9 @@
 using baobzi::fit;
 using baobzi::options;
 
+// Deterministic seeds in tests are intentional: we want reproducible inputs
+// for max-rel-error sweeps.
+// NOLINTBEGIN(cert-msc51-cpp,cert-msc32-c)
 namespace {
 constexpr int N_SAMPLE = 5000;
 
@@ -521,6 +529,68 @@ TEST_CASE("Default 4 MiB memory budget caps runaway fits -- opt-in to raise",
     REQUIRE(std::isfinite(fn(std::array{1.0, 1.0, 1.0})[0]));
 }
 
+TEST_CASE("eval_pack matches scalar operator() across small N", "[baobzi][pack]") {
+    auto f = [](double x) { return std::sin(5.0 * x); };
+    auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10);
+
+    // Small-N (unrolled scalar fan-out) and large-N (batch path) branches.
+    const std::array<double, 4> xs4{0.1, 0.3, 0.5, 0.7};
+    const auto ys4 = fn.eval_pack(xs4);
+    for (std::size_t i = 0; i < xs4.size(); ++i)
+        REQUIRE(ys4[i] == fn(xs4[i]));
+
+    std::array<double, 64> xs64{};
+    for (std::size_t i = 0; i < xs64.size(); ++i)
+        xs64[i] = (static_cast<double>(i) + 0.5) / static_cast<double>(xs64.size());
+    const auto ys64 = fn.eval_pack(xs64);
+    // Batch path uses SIMD coeff layout; results agree with scalar up to
+    // a few ULPs from associativity differences in the Hybrid chain.
+    for (std::size_t i = 0; i < xs64.size(); ++i)
+        REQUIRE(ys64[i] == Catch::Approx(fn(xs64[i])).margin(1e-14));
+}
+
+TEST_CASE("eval_scatter_sorted matches per-pair scalar evals", "[baobzi][scatter]") {
+    // Use a single Func type (std::function) so all fits share a Function
+    // specialization — eval_scatter_sorted takes a span of like pointers.
+    using ff = std::function<double(double)>;
+    std::vector<ff> exact{
+        ff{[](double x) { return std::sin(3.0 * x); }},
+        ff{[](double x) { return std::cos(7.0 * x); }},
+        ff{[](double x) { return x * x - 0.5; }}};
+
+    using fn_t = decltype(fit<8>(exact[0], 0.0, 1.0, 1e-10));
+    std::vector<fn_t> fns;
+    fns.reserve(exact.size());
+    for (auto &g : exact)
+        fns.push_back(fit<8>(g, 0.0, 1.0, /*tol=*/1e-10));
+
+    std::vector<const fn_t *> fit_ptrs;
+    for (auto &fn : fns) fit_ptrs.push_back(&fn);
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<double> dx(0.0, 1.0);
+    std::uniform_int_distribution<std::uint32_t> di(0, 2);
+    constexpr std::size_t n = 137;  // not a multiple of any SIMD width
+    std::vector<std::uint32_t> ids(n);
+    std::vector<double> xs(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        ids[i] = di(gen);
+        xs[i] = dx(gen);
+    }
+    std::vector<double> ys(n);
+    baobzi::eval_scatter_sorted<8, ff>(
+        std::span<const fn_t *const>{fit_ptrs.data(), fit_ptrs.size()},
+        std::span<const std::uint32_t>{ids.data(), ids.size()},
+        std::span<const double>{xs.data(), xs.size()},
+        std::span<double>{ys.data(), ys.size()},
+        /*n_fits=*/static_cast<std::uint32_t>(fit_ptrs.size()));
+
+    // Batched eval per fit goes through the SIMD-batch path; per-fit
+    // results match the scalar operator() up to a few ULPs.
+    for (std::size_t i = 0; i < n; ++i)
+        REQUIRE(ys[i] == Catch::Approx((*fit_ptrs[ids[i]])(xs[i])).margin(1e-14));
+}
+
 TEST_CASE("Batch handles out-of-domain points as NaN", "[baobzi][batch][ood]") {
     auto f = [](double x) { return std::sin(x); };
     auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-10);
@@ -536,3 +606,138 @@ TEST_CASE("Batch handles out-of-domain points as NaN", "[baobzi][batch][ood]") {
     REQUIRE(out[4] == fn(0.9));
     REQUIRE(std::isnan(out[5]));
 }
+
+// Phase-0 parity sweep across all eval_pack<N> branches the bench
+// exercises. Catches kernel-layout drift between the scalar fan-out
+// path (N < 32) and the batch-path delegation (N >= 32) up front.
+TEST_CASE("eval_pack<N> parity sweep matches scalar operator()",
+          "[baobzi][pack][parity]") {
+    auto f = [](double x) { return std::tanh(10.0 * x) * std::sin(3.0 * x); };
+    auto fn = fit<8>(f, -1.0, 1.0, /*tol=*/1e-10);
+
+    auto check = [&](auto N_const) {
+        constexpr std::size_t N = decltype(N_const)::value;
+        std::array<double, N> xs{};
+        for (std::size_t i = 0; i < N; ++i)
+            xs[i] = -1.0 + (2.0 * static_cast<double>(i) + 1.0)
+                           / (2.0 * static_cast<double>(N));
+        const auto ys = fn.eval_pack(xs);
+        for (std::size_t i = 0; i < N; ++i)
+            REQUIRE(ys[i] == Catch::Approx(fn(xs[i])).margin(1e-14));
+    };
+    // Cover both branches: scalar fan-out (< 32) and SIMD batch path (>= 32).
+    check(std::integral_constant<std::size_t, 1>{});
+    check(std::integral_constant<std::size_t, 4>{});
+    check(std::integral_constant<std::size_t, 8>{});
+    check(std::integral_constant<std::size_t, 16>{});
+    check(std::integral_constant<std::size_t, 32>{});
+    check(std::integral_constant<std::size_t, 64>{});
+}
+
+// Counting-sort overload of eval_scatter_sorted: parity with per-pair
+// scalar evals across small/large n and dense/sparse-id shapes.
+TEST_CASE("eval_scatter_sorted counting-sort matches per-pair scalar",
+          "[baobzi][scatter][counting-sort]") {
+    using ff = std::function<double(double)>;
+    constexpr std::uint32_t R = 16;
+    std::vector<ff> exact;
+    exact.reserve(R);
+    std::mt19937 g(7);
+    std::uniform_real_distribution<double> cd(-1.0, 1.0);
+    for (std::uint32_t r = 0; r < R; ++r) {
+        const double a = cd(g), b = cd(g), c = cd(g);
+        exact.emplace_back([a, b, c](double x) {
+            return ((a * x + b) * x + c);  // simple quadratic
+        });
+    }
+    using fn_t = decltype(fit<8>(exact[0], 0.0, 1.0, 1e-10));
+    std::vector<fn_t> fns;
+    for (auto &fexact : exact) fns.push_back(fit<8>(fexact, 0.0, 1.0, /*tol=*/1e-10));
+    std::vector<const fn_t *> fit_ptrs;
+    for (auto &fn : fns) fit_ptrs.push_back(&fn);
+
+    auto check = [&](std::vector<std::uint32_t> ids,
+                     std::vector<double> xs) {
+        const std::size_t n = ids.size();
+        std::vector<double> ys(n);
+        baobzi::eval_scatter_sorted<8, ff>(
+            std::span<const fn_t *const>{fit_ptrs.data(), fit_ptrs.size()},
+            std::span<const std::uint32_t>{ids.data(), ids.size()},
+            std::span<const double>{xs.data(), xs.size()},
+            std::span<double>{ys.data(), ys.size()},
+            R);
+        for (std::size_t i = 0; i < n; ++i)
+            REQUIRE(ys[i] == Catch::Approx((*fit_ptrs[ids[i]])(xs[i]))
+                                 .margin(1e-14));
+    };
+
+    check({}, {});                                 // n=0
+    check({0}, {0.5});                             // n=1
+    check({3, 3, 3, 3}, {0.1, 0.2, 0.3, 0.4});     // single-id
+    check({0, 15, 0, 15, 0, 15, 0},                // sparse-use ids 0, 15
+          {0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4});
+
+    // Random dense workload at the bench shape.
+    std::uniform_int_distribution<std::uint32_t> di(0, R - 1);
+    std::uniform_real_distribution<double> dx(0.0 + 1e-6, 1.0 - 1e-6);
+    std::mt19937 ig(42);
+    constexpr std::size_t n = 256;
+    std::vector<std::uint32_t> ids(n);
+    std::vector<double> xs(n);
+    for (std::size_t i = 0; i < n; ++i) { ids[i] = di(ig); xs[i] = dx(ig); }
+    check(ids, xs);
+}
+
+// Pin the leaf-table build threshold: fits that land at max_depth up
+// to 16 (in 1D) must still get a table — the descent fallback otherwise
+// drops IPC from ~4.5 to ~1.9 and lights up branch-mispredict (measured
+// in bench_pack_scatter on tanh500_deep / tanh1000_deep). Phase 1
+// widened the threshold from 14 to 16.
+TEST_CASE("Leaf-table built at widened depth threshold",
+          "[baobzi][leaf-table]") {
+    // tanh500 at tol=1e-12 deg=6 lands at depth ~16; depth 14 cap
+    // would skip the table here. Phase 1's bump to 16 covers it.
+    auto fn = fit<6>([](double x) { return std::tanh(500.0 * x); },
+                    -1.0, 1.0, /*tol=*/1e-12);
+    REQUIRE(fn.all_subtrees_have_leaf_table());
+
+    // Sanity at the previously-supported depth too — must not regress.
+    auto shallow = fit<8>([](double x) { return 1.0 / (1.0 + 25.0 * x * x); },
+                          -1.0, 1.0, /*tol=*/1e-10);
+    REQUIRE(shallow.all_subtrees_have_leaf_table());
+}
+
+// Edge cases for eval_scatter_sorted: n=0 (no-op), n=1 (single pair),
+// single-fit-id (all runs collapse to one), and a sparse-id case
+// (gaps in fit-id space — caller pads n_fits to cover the max id).
+TEST_CASE("eval_scatter_sorted edge cases", "[baobzi][scatter][edge]") {
+    using ff = std::function<double(double)>;
+    std::vector<ff> exact{
+        ff{[](double x) { return std::sin(x); }},
+        ff{[](double x) { return std::cos(x); }}};
+    using fn_t = decltype(fit<8>(exact[0], 0.0, 1.0, 1e-10));
+    std::vector<fn_t> fns;
+    for (auto &g : exact) fns.push_back(fit<8>(g, 0.0, 1.0, /*tol=*/1e-10));
+    std::vector<const fn_t *> fit_ptrs;
+    for (auto &fn : fns) fit_ptrs.push_back(&fn);
+
+    auto run = [&](std::vector<std::uint32_t> ids, std::vector<double> xs) {
+        std::vector<double> ys(xs.size());
+        const std::uint32_t n_fits =
+            static_cast<std::uint32_t>(fit_ptrs.size());
+        baobzi::eval_scatter_sorted<8, ff>(
+            std::span<const fn_t *const>{fit_ptrs.data(), fit_ptrs.size()},
+            std::span<const std::uint32_t>{ids.data(), ids.size()},
+            std::span<const double>{xs.data(), xs.size()},
+            std::span<double>{ys.data(), ys.size()},
+            n_fits);
+        for (std::size_t i = 0; i < xs.size(); ++i)
+            REQUIRE(ys[i] == Catch::Approx((*fit_ptrs[ids[i]])(xs[i])).margin(1e-14));
+    };
+
+    run({}, {});                                // n=0
+    run({0}, {0.5});                            // n=1
+    run({1, 1, 1, 1, 1}, {0.1, 0.2, 0.3, 0.4, 0.5});  // single-fit-id
+    run({0, 1, 0, 1, 0, 1, 0}, {0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4});
+}
+// NOLINTEND(cert-msc51-cpp,cert-msc32-c)

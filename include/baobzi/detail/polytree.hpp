@@ -131,12 +131,16 @@ struct PolyTree {
         // For shallow subtrees, build a quantize-to-leaf table so
         // eval-time descent collapses to a single load. Table is
         // uint32, 4 B per entry, size 1 << (input_dim * max_depth_).
-        // Capped at 16 K entries (64 KiB) per subtree to stay in L1d
-        // for the common compact-domain shapes.
-        constexpr std::size_t kTableMaxEntries = std::size_t{1} << 14; // 64 KiB / 4 B
+        // Capped at 64 K entries (256 KiB) per subtree — L2-resident
+        // on modern x86 cores (SPR has 2 MiB L2/core, Zen4 1 MiB) and
+        // worth the L1d eviction tradeoff because the descent path
+        // it replaces costs one `vucomisd + ja` per level (IPC ~1.9,
+        // branch-miss 6-10%) vs one `vcvttsd2usi + load` for the
+        // table (measured ~3x worse at depth 15-16 on bench_pack_scatter).
+        constexpr std::size_t kTableMaxEntries = std::size_t{1} << 16; // 256 KiB / 4 B
         if (max_depth_ > 0) {
             const std::size_t total_bits = input_dim * max_depth_;
-            if (total_bits <= 14) {
+            if (total_bits <= 16) {
                 const std::size_t n = std::size_t{1} << total_bits;
                 if (n <= kTableMaxEntries) {
                     leaf_table_.assign(n, std::uint32_t{0});
