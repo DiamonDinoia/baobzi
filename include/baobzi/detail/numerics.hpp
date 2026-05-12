@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <tuple>
 
-#include <polyfit/polyeval.hpp>
+#include <polyfit/polyfit.hpp>
 
 #include <baobzi/detail/tol_kind.hpp>
 #include <baobzi/detail/value.hpp>

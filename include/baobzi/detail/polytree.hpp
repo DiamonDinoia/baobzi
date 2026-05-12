@@ -9,7 +9,8 @@
 #include <vector>
 
 #include <poet/poet.hpp>
-#include <polyfit/polyeval.hpp>
+#include <xsimd/xsimd.hpp>
+#include <polyfit/polyfit.hpp>
 
 #include <baobzi/detail/compiler_macros.hpp>
 #include <baobzi/detail/errors.hpp>
@@ -27,9 +28,10 @@ template <std::size_t Degree, class Func>
 struct PolyTree {
     using input_type = std::remove_cvref_t<poly_eval::fitInput_t<Func>>;
     using value_type = poly_eval::detail::value_type_or_t<input_type>;
-    using poly_eval_type =
-        std::conditional_t<poly_eval::detail::hasTupleSize_v<input_type>, poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never>,
-                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never>>;
+    using poly_eval_type = std::conditional_t<
+        poly_eval::detail::hasTupleSize_v<input_type>,
+        poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>,
+        poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>>;
     using output_type = poly_eval::fitOutput_t<Func>;
 
     static constexpr std::size_t output_dim = value_dim_v<output_type>;
@@ -69,7 +71,7 @@ struct PolyTree {
 
                 if (successful_fit) {
                     assert(polyfits.size() > 0);
-                    assert(node.poly_eval_id == polyfits.size() - 1);
+                    assert(node.poly_eval_id() == polyfits.size() - 1);
                 } else if (at_max_depth) {
                     // Record the failed panel and force-accept the polynomial
                     // as a best-effort leaf. The decision to throw or accept
@@ -85,7 +87,7 @@ struct PolyTree {
                     node.force_fit_as_leaf(func, current_box.center,
                                            current_box.half_length, polyfits);
                 } else {
-                    node.first_child_idx = static_cast<std::uint32_t>(curr_child_idx);
+                    node.set_first_child_idx(static_cast<std::uint32_t>(curr_child_idx));
                     curr_child_idx += n_child;
 
                     const dim_array_t &node_center = current_box.center;
@@ -158,7 +160,7 @@ struct PolyTree {
                             const value_type cell = span / bins;
                             const value_type xc = lower_[0] +
                                 (static_cast<value_type>(q0) + value_type{0.5}) * cell;
-                            leaf_table_[i] = nodes_[get_node_index(xc)].poly_eval_id;
+                            leaf_table_[i] = nodes_[get_node_index(xc)].poly_eval_id();
                         } else {
                             input_type xc;
                             for (std::size_t d = 0; d < input_dim; ++d) {
@@ -169,7 +171,7 @@ struct PolyTree {
                                 xc[d] = lower_[d] +
                                     (static_cast<value_type>(qd) + value_type{0.5}) * cell;
                             }
-                            leaf_table_[i] = nodes_[get_node_index(xc)].poly_eval_id;
+                            leaf_table_[i] = nodes_[get_node_index(xc)].poly_eval_id();
                         }
                     }
                 }
@@ -197,7 +199,7 @@ struct PolyTree {
             });
             return leaf_table_[idx];
         }
-        return nodes_[get_node_index(x)].poly_eval_id;
+        return nodes_[get_node_index(x)].poly_eval_id();
     }
 
     [[nodiscard]] constexpr auto has_leaf_table() const noexcept -> bool { return !leaf_table_.empty(); }
@@ -213,6 +215,63 @@ struct PolyTree {
     /// per-axis loop keeps the OOD path off the hot fall-through —
     /// flag-and-post-check formulations regressed 1D batch by 4–7 %
     /// (paired-median, n=24).
+    /// 1D batch leaf-id traversal — counterpart to `find_leaf_id_with_ood`
+    /// but amortised across `xsimd::batch<value_type>::size` points per
+    /// iteration. Used by `Function::eval_batch_tile` when this subtree
+    /// owns the whole domain (so OOD detection collapses into the same
+    /// unsigned-wrap test as the table index — see the per-point variant
+    /// above).
+    ///
+    /// Pipeline per SIMD chunk:
+    ///   1. SIMD compute: `q = (x - lo) * inv_span_bins` for `simd_size`
+    ///      lanes (one `load_unaligned`, one sub, one mul). Truncating
+    ///      conversion to int produces INT64_MIN on x86 for OOD doubles,
+    ///      which compares above `mask` as uint64 — same single-cmp
+    ///      OOD trick used by the scalar variant.
+    ///   2. Scalar lane sweep: per-lane table lookup `leaf_table_[q]`
+    ///      and histogram bump `++counts[id]`. Vectorised gather/scatter
+    ///      lose to bank-conflict serialization on shared counters
+    ///      (FINUFFT spread.hpp:454-457 documents the same finding).
+    ///
+    /// The trailing `n % simd_size` points are dispatched through the
+    /// scalar quantize for clarity; the loop is short enough that the
+    /// branch-predictor handles it without measurable cost.
+    template <class LeafIdT, class CountT>
+    BAOBZI_ALWAYS_INLINE auto
+    find_leaf_ids_batch(const value_type *xp, LeafIdT *leaf_ids,
+                        CountT *counts, std::uint32_t ood_id,
+                        std::size_t n) const -> void
+        requires (input_dim == 1)
+    {
+        using batch_t                 = xsimd::batch<value_type>;
+        constexpr std::size_t lanes   = batch_t::size;
+        constexpr std::size_t aligned = batch_t::arch_type::alignment();
+
+        const std::size_t mask  = (std::size_t{1} << leaf_table_depth_) - 1;
+        const auto        lo_v  = batch_t::broadcast(lower_[0]);
+        const auto        inv_v = batch_t::broadcast(inv_span_bins_[0]);
+
+        auto place_one = [&](std::size_t dst, std::int64_t qi) {
+            const auto id = (static_cast<std::uint64_t>(qi) > mask)
+                                ? ood_id
+                                : leaf_table_[static_cast<std::size_t>(qi)];
+            leaf_ids[dst] = static_cast<LeafIdT>(id);
+            ++counts[id];
+        };
+
+        alignas(aligned) std::array<value_type, lanes> q_arr{};
+        const std::size_t n_simd = (n / lanes) * lanes;
+        for (std::size_t i = 0; i < n_simd; i += lanes) {
+            const auto x_v = batch_t::load_unaligned(xp + i);
+            ((x_v - lo_v) * inv_v).store_aligned(q_arr.data());
+            for (std::size_t j = 0; j < lanes; ++j)
+                place_one(i + j, static_cast<std::int64_t>(q_arr[j]));
+        }
+        for (std::size_t i = n_simd; i < n; ++i)
+            place_one(i, static_cast<std::int64_t>(
+                            (xp[i] - lower_[0]) * inv_span_bins_[0]));
+    }
+
     [[nodiscard]] BAOBZI_ALWAYS_INLINE auto
     find_leaf_id_with_ood(const input_type &x, std::uint32_t ood_id) const -> std::uint32_t {
         const std::size_t bits = leaf_table_depth_;
@@ -260,13 +319,15 @@ struct PolyTree {
                 child_idx |= (static_cast<index_t>(upper) << d);
                 (upper ? lo[d] : hi[d]) = mid_d;
             });
-            curr_index = nodes_[curr_index].first_child_idx + child_idx;
+            curr_index = nodes_[curr_index].first_child_idx() + child_idx;
         }
         return curr_index;
     }
 
     [[nodiscard]] constexpr auto size() const -> std::size_t { return nodes_.size(); }
     [[nodiscard]] constexpr auto max_depth() const -> std::size_t { return max_depth_; }
+    [[nodiscard]] auto lower() const noexcept -> const dim_array_t & { return lower_; }
+    [[nodiscard]] auto upper() const noexcept -> const dim_array_t & { return upper_; }
 
     [[nodiscard]] auto memory_usage() const -> std::size_t {
         std::size_t total = sizeof(*this);

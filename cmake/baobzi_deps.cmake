@@ -31,7 +31,7 @@ set(CPM_xsimd_SOURCE "${_baobzi_xsimd_fork}" CACHE PATH "" FORCE)
 FetchContent_Declare(
     polyfit
     GIT_REPOSITORY https://github.com/DiamonDinoia/polyfit.git
-    GIT_TAG        7dda474
+    GIT_TAG        bccda2f58b7cba202f74c13d633a589b1f119d24
     SYSTEM
 )
 set(POLYFIT_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -41,7 +41,7 @@ FetchContent_MakeAvailable(polyfit)
 FetchContent_Declare(
     poet
     GIT_REPOSITORY https://github.com/DiamonDinoia/POET.git
-    GIT_TAG        af0d3a482f4d35da8277f73ef63858037d636441
+    GIT_TAG        b55580fd1f17df500abb8afb16cd4983e66a27ac
     SYSTEM
 )
 set(POET_BUILD_TESTS      OFF CACHE BOOL "" FORCE)

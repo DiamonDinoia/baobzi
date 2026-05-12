@@ -8,29 +8,22 @@
 ///
 /// Thread safety. Once `baobzi::fit(...)` returns, the resulting Function is
 /// immutable and its `operator()` is safe to call concurrently from multiple
-/// threads, provided each call writes to a disjoint output slice. Per-call
-/// scratch is held in `thread_local` storage; nothing on the eval path
-/// mutates shared state. Baobzi does not parallelize internally — callers
-/// chunk their inputs and spawn threads themselves; this contract makes that
-/// pattern safe. See `tests/test_threadsafe.cpp`.
+/// threads, provided each call writes to a disjoint output slice. The batch
+/// path allocates and frees its scratch buffers on each call (stack-local
+/// owning `unique_ptr<T[]>`), so nothing on the eval path mutates shared
+/// state. Baobzi does not parallelize internally — callers chunk their
+/// inputs and spawn threads themselves; this contract makes that pattern
+/// safe. See `tests/test_threadsafe.cpp`.
 ///
-/// Memory cost of fit-time knobs. Tightening `tol`, raising `max_depth`,
-/// raising `max_memory_mib`, or enabling `allow_max_depth_leaves` all
-/// increase the leaf count `L`. Two memory budgets scale with `L`:
-///   - **Persistent tree** (one copy, shared by all threads): `O(L)`.
-///     Reported by `Function::print_stats()` / `memory_usage()`.
-///   - **Per-thread eval scratch** (lazy, thread_local, allocated on the
-///     first batch call): the batch path tiles at
-///     `tile_K = max(65536, 32 * L)`, and each tile holds packed input,
-///     packed output, leaf-id, perm, count, and offset buffers. So the
-///     per-thread footprint is roughly
-///     `tile_K * (8 + (input_dim + output_dim) * sizeof(value_type))` plus
-///     `8 * (L + 1)` bytes, multiplied by `(threads × distinct Function
-///     template instantiations touched)`. The vectors never shrink. For
-///     smooth functions `L` stays in the hundreds and the scratch is
-///     ~1–3 MiB; for `L = 10^5` it is ~80 MiB per thread; for `L = 10^6`
-///     it is ~800 MiB per thread. `print_stats()` reports a worst-case
-///     estimate so the cost is visible at fit time.
+/// Memory cost. Tightening `tol`, raising `max_depth`, raising
+/// `max_memory_mib`, or enabling `allow_max_depth_leaves` all increase the
+/// leaf count `L`. The Function holds one persistent allocation: the tree
+/// itself, `O(L)`, shared by all threads and reported by
+/// `Function::print_stats()` / `memory_usage()`. Batch-eval scratch is
+/// allocated and freed inside each `operator()(xp, res, n)` call; its
+/// per-call peak is roughly `tile_K * (8 + (input_dim + output_dim) *
+/// sizeof(value_type))` plus `8 * (L + 1)` bytes, with
+/// `tile_K = max(65536, 32 * L)`.
 
 #include <array>
 #include <concepts>
@@ -40,7 +33,7 @@
 #include <type_traits>
 #include <utility>
 
-#include <polyfit/polyeval.hpp>
+#include <polyfit/polyfit.hpp>
 
 namespace baobzi {
 

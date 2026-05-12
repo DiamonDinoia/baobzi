@@ -8,8 +8,9 @@
 #include <type_traits>
 #include <vector>
 
-#include <polyfit/polyeval.hpp>
+#include <polyfit/polyfit.hpp>
 
+#include <baobzi/detail/compiler_macros.hpp>
 #include <baobzi/detail/numerics.hpp>
 #include <baobzi/detail/tol_kind.hpp>
 #include <baobzi/detail/value.hpp>
@@ -28,20 +29,28 @@ class Node {
     using input_type = std::remove_cvref_t<poly_eval::fitInput_t<Func>>;
     using output_type = poly_eval::fitOutput_t<Func>;
     using value_type = poly_eval::detail::value_type_or_t<input_type>;
-    using poly_eval_type = std::conditional_t<poly_eval::detail::hasTupleSize_v<input_type>, poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never>,
-                                  poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never>>;
+    using poly_eval_type = std::conditional_t<
+        poly_eval::detail::hasTupleSize_v<input_type>,
+        poly_eval::FuncEvalND<Func, Degree, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>,
+        poly_eval::FuncEval<Func, Degree, 1, poly_eval::FusionMode::Never, poly_eval::ScalarKernel::Hybrid>>;
 
     static constexpr std::size_t input_dim = value_dim_v<input_type>;
     static constexpr std::size_t output_dim = value_dim_v<output_type>;
 
     static constexpr std::uint32_t kLeafSentinel = std::numeric_limits<std::uint32_t>::max();
 
-    std::uint32_t first_child_idx = kLeafSentinel;
-    std::uint32_t poly_eval_id    = kLeafSentinel;
-
     Node() = default;
 
-    [[nodiscard]] auto is_leaf() const -> bool { return first_child_idx == kLeafSentinel; }
+    [[nodiscard]] BAOBZI_ALWAYS_INLINE auto first_child_idx() const noexcept -> std::uint32_t {
+        return first_child_idx_;
+    }
+    [[nodiscard]] BAOBZI_ALWAYS_INLINE auto poly_eval_id() const noexcept -> std::uint32_t {
+        return poly_eval_id_;
+    }
+    [[nodiscard]] auto is_leaf() const -> bool { return first_child_idx_ == kLeafSentinel; }
+
+    auto set_first_child_idx(std::uint32_t v) noexcept -> void { first_child_idx_ = v; }
+    auto set_poly_eval_id(std::uint32_t v) noexcept -> void { poly_eval_id_ = v; }
 
     /// Fit this node to the requested tolerance. On success, stores the
     /// poly_eval_id into polyfits and returns true. Center/half_length are
@@ -75,7 +84,7 @@ class Node {
                 return rollback_and_fail();
         }
 
-        poly_eval_id = static_cast<std::uint32_t>(n_polyfit_before);
+        poly_eval_id_ = static_cast<std::uint32_t>(n_polyfit_before);
         return true;
     }
 
@@ -88,10 +97,14 @@ class Node {
         const input_type lb = center - half_length;
         const input_type ub = center + half_length;
         polyfits.emplace_back(func, lb, ub);
-        poly_eval_id = static_cast<std::uint32_t>(polyfits.size() - 1);
+        poly_eval_id_ = static_cast<std::uint32_t>(polyfits.size() - 1);
     }
 
     [[nodiscard]] auto memory_usage() const -> std::size_t { return sizeof(*this); }
+
+  private:
+    std::uint32_t first_child_idx_ = kLeafSentinel;
+    std::uint32_t poly_eval_id_    = kLeafSentinel;
 };
 
 // Lock the 8-B node invariant. If this fires, an extra field was added

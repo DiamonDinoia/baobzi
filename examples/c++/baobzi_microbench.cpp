@@ -149,6 +149,80 @@ void sweep_nd(ankerl::nanobench::Bench &b, const char *label, Fmaker make_f,
     }
 }
 
+// Multi-fit scattered-access case modelled on the TRIQS/diagmc bench_chebfun
+// workload: R independent 1D fits over [0, beta], evaluated at scattered
+// (r_idx, tau) pairs. Exercises the scalar `Function::operator()` (NOT the
+// batched fn(xs, out, n) path), which is what production callers in TRIQS/
+// diagmc hit when filling Wick matrices or Green-function lookups.
+template <std::size_t Deg>
+void sweep_multi_fit_1d(ankerl::nanobench::Bench &b, const char *label,
+                        std::size_t R, double beta) {
+    std::mt19937 cgen(11);
+    // Cap K below Deg so the underlying truth is exactly representable by
+    // the leaf polynomial — keeps fit depth shallow and reproducible.
+    const std::size_t K = std::min<std::size_t>(Deg - 1, 6);
+    std::vector<std::vector<double>> coefs(R, std::vector<double>(K));
+    {
+        std::uniform_real_distribution<double> cd(-1.0, 1.0);
+        for (auto &cr : coefs) for (auto &c : cr) c = cd(cgen);
+    }
+
+    auto truth_for = [&, beta](std::size_t r) {
+        const auto &cr = coefs[r];
+        return [cr, beta](double tau) {
+            const double y = 2.0 * tau / beta - 1.0;   // [-1, 1]
+            double sum = 0.0;
+            for (std::size_t k = 0; k < cr.size(); ++k) {
+                double Tk = (k == 0) ? 1.0 : (k == 1 ? y : 0.0);
+                if (k >= 2) {
+                    double Tk_1 = y, Tk_2 = 1.0;
+                    for (std::size_t i = 2; i <= k; ++i) {
+                        double Tn = 2.0 * y * Tk_1 - Tk_2;
+                        Tk_2 = Tk_1; Tk_1 = Tn;
+                    }
+                    Tk = Tk_1;
+                }
+                sum += cr[k] * Tk;
+            }
+            return sum;
+        };
+    };
+
+    using fit_t = decltype(baobzi::fit<Deg>(std::function<double(double)>{},
+                                            0.0, 1.0, 1e-10));
+    std::vector<fit_t> fits;
+    fits.reserve(R);
+    for (std::size_t r = 0; r < R; ++r) {
+        std::function<double(double)> f = truth_for(r);
+        fits.emplace_back(baobzi::fit<Deg>(f, 0.0, beta, /*tol=*/1e-10));
+    }
+
+    std::mt19937 ig(13);
+    std::uniform_int_distribution<std::size_t> rd(0, R - 1);
+    std::uniform_real_distribution<double> td(1e-9, beta - 1e-9);
+
+    for (std::size_t n_pts : {std::size_t(1), std::size_t(32),
+                              std::size_t(1024), std::size_t(1'000'000)}) {
+        std::vector<std::size_t> rs(n_pts);
+        std::vector<double> taus(n_pts);
+        for (std::size_t i = 0; i < n_pts; ++i) {
+            rs[i]   = rd(ig);
+            taus[i] = td(ig);
+        }
+
+        std::string name = std::string(label) + " deg=" + std::to_string(Deg) +
+                           " R=" + std::to_string(R) +
+                           " N=" + std::to_string(n_pts);
+        b.batch(static_cast<double>(n_pts));
+        b.run(name, [&] {
+            double acc = 0.0;
+            for (std::size_t i = 0; i < n_pts; ++i)
+                acc += fits[rs[i]](taus[i]);
+            ankerl::nanobench::doNotOptimizeAway(acc);
+        });
+    }
+}
+
 } // namespace
 
 int main() {
@@ -166,6 +240,9 @@ int main() {
         sweep_1d<8>(b,  "1d_bessel_j0",   make_j0_1d,    0.5, 30.0);
     sweep_1d<10>(b, "1d_tanh_sharp",  make_tanh1d,  -1.0, 1.0);
     sweep_1d<8>(b,  "1d_log1p",       make_log1p1d, -0.9, 5.0);
+
+    // Multi-fit scattered-access case (TRIQS/diagmc bench_chebfun shape).
+    sweep_multi_fit_1d<8>(b, "1d_multi_fit", /*R=*/16, /*beta=*/10.0);
 
     // 2D suite
     sweep_nd<6, 2>(b,  "2d_bump",  make_bump2d, {0.0, 0.0}, {1.0, 1.0});
