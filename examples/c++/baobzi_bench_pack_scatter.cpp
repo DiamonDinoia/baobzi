@@ -181,7 +181,7 @@ void sweep_scatter_1d(ankerl::nanobench::Bench &b, const char *label,
     std::vector<const fit_t *> fit_ptrs;
     for (auto &fn : fits) fit_ptrs.push_back(&fn);
 
-    std::mt19937 ig(13 + R);
+    std::mt19937 ig(static_cast<std::uint32_t>(13 + R));
     std::uniform_int_distribution<std::uint32_t> rd(
         0, static_cast<std::uint32_t>(R - 1));
     std::uniform_real_distribution<double> td(1e-6, 1.0 - 1e-6);

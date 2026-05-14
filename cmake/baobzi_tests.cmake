@@ -19,7 +19,7 @@ function(_baobzi_add_cpp_test name source)
   # clang flags as a C2y extension; the warning is harmless and out of our
   # control (lives in Catch2 macros), so silence it on test targets only.
   target_compile_options(${name} PRIVATE
-    $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:-Wno-c2y-extensions>)
+    $<$<AND:$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,19>>:-Wno-c2y-extensions>)
   catch_discover_tests(${name})
 endfunction()
 
@@ -27,5 +27,6 @@ _baobzi_add_cpp_test(test_template tests/test_template.cpp)
 _baobzi_add_cpp_test(test_cpp      tests/test_cpp.cpp)
 _baobzi_add_cpp_test(test_greens   tests/test_greens.cpp)
 _baobzi_add_cpp_test(test_threadsafe tests/test_threadsafe.cpp)
+_baobzi_add_cpp_test(test_scratch    tests/test_scratch.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test_threadsafe PRIVATE Threads::Threads)

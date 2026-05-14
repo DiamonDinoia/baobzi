@@ -83,6 +83,17 @@ struct options {
     /// `Function::non_converged_panels()`. Default false (throw, with
     /// the panel list attached on the exception).
     bool    allow_max_depth_leaves = false;
+    /// Force BFS to refine every panel to at least this depth before
+    /// the per-panel tolerance test exits. Useful for driving the
+    /// leaf-table fast path (`PolyTree::quantize_one`): a uniformly-
+    /// refined tree of depth D in input_dim K builds a 2^(K*D)-entry
+    /// quantize table the eval-time lookup collapses to one SIMD
+    /// quantize + one u32 load. Table size grows as
+    /// 2^(K*D) * 4 B and is capped at 64 K entries (256 KiB) per
+    /// subtree, so values that push past `K*D > 16` will still build
+    /// a uniform tree but not the table. Default 0 (no forcing —
+    /// tol-based refinement only).
+    int     min_uniform_depth      = 0;
 };
 
 /// Any callable that accepts `Domain` and returns a value.
@@ -106,6 +117,7 @@ inline auto make_input(int input_dim, int output_dim, int degree,
     in.max_depth              = opts.max_depth;
     in.max_memory_mib         = opts.max_memory_mib;
     in.allow_max_depth_leaves = opts.allow_max_depth_leaves;
+    in.min_uniform_depth      = opts.min_uniform_depth;
     return in;
 }
 

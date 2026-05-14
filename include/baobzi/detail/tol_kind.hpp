@@ -24,6 +24,14 @@ struct TreeInput {
     int     max_depth              = 50;
     int     max_memory_mib         = 4;
     bool    allow_max_depth_leaves = false;
+    /// Force BFS to refine every panel to at least this depth before
+    /// the per-panel tolerance test is allowed to mark a node as a leaf.
+    /// Useful for driving the leaf-table fast path: a uniformly-refined
+    /// tree of depth D in input_dim K builds a 2^(K*D)-entry quantize
+    /// table at construction (see PolyTree::leaf_table_), turning the
+    /// eval-time leaf lookup into one SIMD quantize + one u32 load.
+    /// Default 0 (no forcing — tol-based refinement only).
+    int     min_uniform_depth      = 0;
     TolKind tol_kind               = TolKind::RelativeMax;
 };
 

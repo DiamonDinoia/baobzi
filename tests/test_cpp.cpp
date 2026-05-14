@@ -339,6 +339,42 @@ TEST_CASE("Batch vs single evaluation agree -- 2D vector output", "[baobzi][batc
     }
 }
 
+// C1 — batch path no longer materialises a `leaf_ids[]` buffer; the
+// scatter loop recomputes the leaf id via `PolyTree::quantize_one`.
+// Pin the result of that recompute path: 1D input, output_dim=2,
+// 1000 deterministic random points must match per-point scalar
+// evaluation. Tightens the existing 2D-in coverage to the 1D batch
+// path that owns the SIMD quantize fast path.
+TEST_CASE("Batch (1D in, 2D out) matches per-point scalar after leaf_ids drop",
+          "[baobzi][batch][1d][c1]") {
+    // baobzi requires array-input for vector-output fits; spell the
+    // 1D input as std::array<double, 1> to route through polyfit's
+    // FuncEvalND. The eval path under test is the same SIMD-quantize
+    // 1D batch kernel (input_dim == 1).
+    auto f = [](std::array<double, 1> x) -> std::array<double, 2> {
+        return {std::sin(3.0 * x[0]), std::cos(2.5 * x[0] + 0.1)};
+    };
+    auto fn = fit<8>(f, std::array{0.0}, std::array{1.0}, /*tol=*/1e-10);
+
+    std::mt19937 gen(123);
+    std::uniform_real_distribution<double> d(1e-3, 1.0 - 1e-3);
+    constexpr std::size_t N = 1000;
+    std::vector<double> xs(N);
+    for (std::size_t i = 0; i < N; ++i) xs[i] = d(gen);
+
+    std::vector<double> batch(2 * N);
+    fn(xs.data(), batch.data(), N);
+
+    constexpr double ulp = std::numeric_limits<double>::epsilon();
+    for (std::size_t i = 0; i < N; ++i) {
+        const auto single = fn(std::array{xs[i]});
+        REQUIRE(std::abs(single[0] - batch[2 * i])
+                <= 4.0 * ulp * std::max(1.0, std::abs(single[0])));
+        REQUIRE(std::abs(single[1] - batch[2 * i + 1])
+                <= 4.0 * ulp * std::max(1.0, std::abs(single[1])));
+    }
+}
+
 TEST_CASE("Batch vs single evaluation agree -- 3D scalar output", "[baobzi][batch][3d]") {
     auto f = [](std::array<double, 3> x) -> std::array<double, 1> {
         return {std::exp(-x[0] * x[0] - x[1] * x[1] - x[2] * x[2])};
@@ -705,6 +741,41 @@ TEST_CASE("Leaf-table built at widened depth threshold",
     auto shallow = fit<8>([](double x) { return 1.0 / (1.0 + 25.0 * x * x); },
                           -1.0, 1.0, /*tol=*/1e-10);
     REQUIRE(shallow.all_subtrees_have_leaf_table());
+}
+
+// D1 — `min_uniform_depth` forces uniform refinement so the leaf-table
+// fast path can be driven deliberately on smooth functions (where
+// tol-based refinement would otherwise stop at depth 1-2 and skip the
+// table). With min_uniform_depth=2 on a near-trivial 1D fit the tree
+// has at least 2^2=4 leaves and the table is live.
+TEST_CASE("min_uniform_depth forces uniform refinement and builds leaf table",
+          "[baobzi][min_uniform_depth][leaf-table]") {
+    auto f = [](double x) { return std::cos(x); };
+    auto fn = fit<8>(f, 0.0, 1.0, /*tol=*/1e-3,
+                     options{.min_uniform_depth = 2});
+
+    // Leaf table is live — driving condition for the SIMD-quantize
+    // fast path in the batch eval pipeline.
+    REQUIRE(fn.all_subtrees_have_leaf_table());
+
+    // Total leaves >= 2^min_uniform_depth = 4 across all subtrees.
+    auto count_leaves = [&]() {
+        std::size_t n_leaves = 0;
+        for (const auto &subtree : fn.get_subtrees())
+            for (const auto &node : subtree.get_nodes())
+                n_leaves += static_cast<std::size_t>(node.is_leaf());
+        return n_leaves;
+    };
+    REQUIRE(count_leaves() >= 4u);
+
+    // Default (no forcing) on the same fit lands at a single leaf —
+    // proves the knob is the cause of the multi-leaf result above.
+    auto fn_default = fit<8>(f, 0.0, 1.0, /*tol=*/1e-3);
+    std::size_t default_leaves = 0;
+    for (const auto &subtree : fn_default.get_subtrees())
+        for (const auto &node : subtree.get_nodes())
+            default_leaves += static_cast<std::size_t>(node.is_leaf());
+    REQUIRE(default_leaves < count_leaves());
 }
 
 // Edge cases for eval_scatter_sorted: n=0 (no-op), n=1 (single pair),

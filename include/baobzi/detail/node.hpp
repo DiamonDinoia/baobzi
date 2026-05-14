@@ -73,10 +73,30 @@ class Node {
 
         auto polyfit = polyfits.emplace_back(func, lb, ub);
 
-        if (input.tol_kind == TolKind::RelativeTail || input.tol_kind == TolKind::AbsoluteTail) {
-            if (tail_error_below_tolerance(input.tol_kind, input.tol, polyfit))
+        // tail_error reads coefficients out of polyfit's 1D `FuncEval` and is
+        // not meaningful for the ND / array-output path (which uses
+        // `FuncEvalND` with multi-axis coefficient storage). Gate the call so
+        // array/ND fits still compile, and fail loudly at runtime if the user
+        // asks for a Tail TolKind on an unsupported shape.
+        constexpr bool kTailErrorSupported =
+            !poly_eval::detail::hasTupleSize_v<input_type> &&
+            !poly_eval::detail::hasTupleSize_v<output_type>;
+        const bool wants_tail = input.tol_kind == TolKind::RelativeTail ||
+                                input.tol_kind == TolKind::AbsoluteTail;
+        if constexpr (kTailErrorSupported) {
+            if (wants_tail) {
+                if (tail_error_below_tolerance(input.tol_kind, input.tol, polyfit))
+                    return rollback_and_fail();
+            } else if (sample_error_below_tolerance(kFitSamplesPerDim, input.tol_kind, input.tol,
+                                                    center, half_length, func, polyfit)) {
                 return rollback_and_fail();
+            }
         } else {
+            if (wants_tail)
+                throw std::runtime_error(
+                    "Baobzi fit error: TolKind::RelativeTail / AbsoluteTail "
+                    "is only supported for 1D scalar→scalar fits; use a "
+                    "sample-based TolKind for array-valued or ND fits");
             if (sample_error_below_tolerance(kFitSamplesPerDim, input.tol_kind, input.tol,
                                              center, half_length, func, polyfit))
                 return rollback_and_fail();

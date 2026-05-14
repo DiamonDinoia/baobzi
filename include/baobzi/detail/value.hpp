@@ -135,8 +135,8 @@ class Value {
     }
 
     operator std::array<T, N>() const {
-        static_assert(N != 1, "Can only cast to array if N != 1");
-        return data_;
+        if constexpr (N == 1) return std::array<T, 1>{data_};
+        else                  return data_;
     }
 
     [[nodiscard]] auto scalar() const -> const T & {

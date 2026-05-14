@@ -57,6 +57,15 @@ struct PolyTree {
             // its tolerance check here cannot be subdivided further.
             const bool at_max_depth =
                 max_depth_ == static_cast<std::size_t>(input.max_depth);
+            // Force uniform refinement to the requested depth before
+            // accepting any leaf, so the per-subtree quantize→leaf table
+            // (built at the bottom of this BFS) covers the whole domain
+            // at a known minimum depth. Useful when the caller wants the
+            // SIMD-quantize fast path active on functions where tol-based
+            // refinement would otherwise leave a ragged tree.
+            const bool force_subdivide =
+                max_depth_ < static_cast<std::size_t>(input.min_uniform_depth)
+                && !at_max_depth;
             for (std::size_t i = 0; i < n_next; ++i) {
                 box_t current_box = q.front();
                 q.pop();
@@ -64,8 +73,18 @@ struct PolyTree {
                 nodes_.emplace_back();
 
                 auto &node = nodes_[i + node_index];
-                const bool successful_fit = node.fit(input, func, current_box.center,
-                                                     current_box.half_length, {}, polyfits);
+                bool successful_fit = node.fit(input, func, current_box.center,
+                                               current_box.half_length, {}, polyfits);
+
+                // Force-uniform: roll back the just-accepted polynomial and
+                // treat the node as failing convergence, so the subdivide
+                // branch below adds children. Keeps the leaf-table fast
+                // path live at the depth the user asked for.
+                if (successful_fit && force_subdivide) {
+                    polyfits.pop_back();
+                    node.set_poly_eval_id(Node<Func, Degree, Policy>::kLeafSentinel);
+                    successful_fit = false;
+                }
 
                 if (successful_fit) {
                     assert(polyfits.size() > 0);
@@ -155,8 +174,13 @@ struct PolyTree {
                         std::size_t r = i;
                         const std::size_t bits = max_depth_;
                         const std::size_t mask = (std::size_t{1} << bits) - 1;
-                        // Compute cell-center x and descend the tree.
-                        if constexpr (input_dim == 1) {
+                        // Compute cell-center x and descend the tree. The
+                        // dispatch is on the *shape* of `input_type`, not on
+                        // `input_dim`: a scalar-input 1D fit needs a plain
+                        // `value_type` xc to match `get_node_index`'s
+                        // signature, while `array<T,1>` and ND inputs share
+                        // the indexed path below.
+                        if constexpr (!poly_eval::detail::hasTupleSize_v<input_type>) {
                             const std::size_t q0 = r & mask;
                             const value_type span = upper_[0] - lower_[0];
                             const value_type cell = span / bins;
@@ -206,8 +230,17 @@ struct PolyTree {
 
     [[nodiscard]] constexpr auto has_leaf_table() const noexcept -> bool { return !leaf_table_.empty(); }
 
-    /// Leaf-id lookup that returns `ood_id` for points outside this
-    /// subtree's domain. Caller must have verified `has_leaf_table()`.
+    /// Entry count of the leaf-id quantize table; 0 when not built.
+    /// Used by `Function::print_stats` to report fast-path memory.
+    [[nodiscard]] constexpr auto leaf_table_size() const noexcept -> std::size_t { return leaf_table_.size(); }
+
+    /// Compute the leaf id for a single point via the leaf-table fast
+    /// path. 1D uses one scalar quantize + unsigned wrap OOD; ND iterates
+    /// per axis and bails on the first out-of-range axis. Caller must
+    /// have verified `has_leaf_table()` — this is the shared kernel
+    /// used by `find_leaf_id_with_ood` (scalar API) and the per-lane
+    /// body of `find_leaf_ids_batch` (1D SIMD batch path), as well as
+    /// the scatter recompute in `Function::eval_batch_tile`.
     ///
     /// The signed `vcvttsd2si` + unsigned compare folds the OOD test
     /// into the table-index quantize: an out-of-range double yields
@@ -217,12 +250,34 @@ struct PolyTree {
     /// per-axis loop keeps the OOD path off the hot fall-through —
     /// flag-and-post-check formulations regressed 1D batch by 4–7 %
     /// (paired-median, n=24).
-    /// 1D batch leaf-id traversal — counterpart to `find_leaf_id_with_ood`
-    /// but amortised across `xsimd::batch<value_type>::size` points per
-    /// iteration. Used by `Function::eval_batch_tile` when this subtree
-    /// owns the whole domain (so OOD detection collapses into the same
-    /// unsigned-wrap test as the table index — see the per-point variant
-    /// above).
+    [[nodiscard]] BAOBZI_ALWAYS_INLINE auto
+    quantize_one(const input_type &x, std::uint32_t ood_id) const noexcept -> std::uint32_t {
+        const std::size_t bits = leaf_table_depth_;
+        const std::size_t mask = (std::size_t{1} << bits) - 1;
+        if constexpr (!poly_eval::detail::hasTupleSize_v<input_type>) {
+            const auto q0 = static_cast<std::int64_t>(
+                (x - lower_[0]) * inv_span_bins_[0]);
+            if (static_cast<std::uint64_t>(q0) > mask) [[unlikely]] return ood_id;
+            return leaf_table_[static_cast<std::size_t>(q0)];
+        } else {
+            std::size_t idx = 0;
+            for (std::size_t d = 0; d < input_dim; ++d) {
+                const auto qd = static_cast<std::int64_t>(
+                    (x[d] - lower_[d]) * inv_span_bins_[d]);
+                if (static_cast<std::uint64_t>(qd) > mask) [[unlikely]] return ood_id;
+                idx |= static_cast<std::size_t>(qd) << (bits * d);
+            }
+            return leaf_table_[idx];
+        }
+    }
+
+    /// 1D batch leaf-id stream — invokes `on_id(i, id)` for every point in
+    /// `[xp, xp+n)`, amortising the quantize across
+    /// `xsimd::batch<value_type>::size` lanes per iteration. Caller picks
+    /// the per-point side effect: `Function::eval_batch_tile` uses this
+    /// twice, first to bump `counts[id]` (the histogram), then to scatter
+    /// `xp_packed[counts[id]++] = xp[i]` (no `leaf_ids[]` materialisation
+    /// in between — see FINUFFT bin-sort recon, spread.hpp:421).
     ///
     /// Pipeline per SIMD chunk:
     ///   1. SIMD compute: `q = (x - lo) * inv_span_bins` for `simd_size`
@@ -230,69 +285,90 @@ struct PolyTree {
     ///      conversion to int produces INT64_MIN on x86 for OOD doubles,
     ///      which compares above `mask` as uint64 — same single-cmp
     ///      OOD trick used by the scalar variant.
-    ///   2. Scalar lane sweep: per-lane table lookup `leaf_table_[q]`
-    ///      and histogram bump `++counts[id]`. Vectorised gather/scatter
+    ///   2. Scalar lane sweep: per-lane table lookup `leaf_table_[q]` (or
+    ///      `ood_id` on wrap) and the user-supplied `on_id(i+j, id)`
+    ///      callback. Vectorised gather/scatter to the histogram would
     ///      lose to bank-conflict serialization on shared counters
     ///      (FINUFFT spread.hpp:454-457 documents the same finding).
     ///
     /// The trailing `n % simd_size` points are dispatched through the
     /// scalar quantize for clarity; the loop is short enough that the
     /// branch-predictor handles it without measurable cost.
-    template <class LeafIdT, class CountT>
+    template <class OnId>
     BAOBZI_ALWAYS_INLINE auto
-    find_leaf_ids_batch(const value_type *xp, LeafIdT *leaf_ids,
-                        CountT *counts, std::uint32_t ood_id,
-                        std::size_t n) const -> void
+    for_each_leaf_id_batch(const value_type *xp, std::uint32_t ood_id,
+                           std::size_t n, OnId on_id) const -> void
         requires (input_dim == 1)
     {
         using batch_t                 = xsimd::batch<value_type>;
         constexpr std::size_t lanes   = batch_t::size;
         constexpr std::size_t aligned = batch_t::arch_type::alignment();
 
+        // AVX-512DQ owns the only x86 `fast_cast(double, int64_t)`
+        // intrinsic (`_mm512_cvttpd_epi64` / `vcvttpd2qq`, see
+        // xsimd_avx512dq.hpp:259). Without it, `xsimd::batch_cast<int64_t>`
+        // falls back to xsimd's per-lane scalar conversion — slower
+        // than the lane-by-lane `vcvttsd2si` we already emit, *and*
+        // through the generic emulator it does not preserve the
+        // INT64_MIN-on-OOD semantics the wrap test relies on (see the
+        // cuda_l1d hank103.cpp comment about wrong masks from xsimd's
+        // generic fallback). Gate hard on `__AVX512DQ__` and keep the
+        // AVX2 / SSE path on the per-lane truncate.
+#if defined(__AVX512DQ__)
+        constexpr bool kFastTruncateInt64 = true;
+#else
+        constexpr bool kFastTruncateInt64 = false;
+#endif
+
         const std::size_t mask  = (std::size_t{1} << leaf_table_depth_) - 1;
         const auto        lo_v  = batch_t::broadcast(lower_[0]);
         const auto        inv_v = batch_t::broadcast(inv_span_bins_[0]);
 
-        auto place_one = [&](std::size_t dst, std::int64_t qi) {
-            const auto id = (static_cast<std::uint64_t>(qi) > mask)
-                                ? ood_id
-                                : leaf_table_[static_cast<std::size_t>(qi)];
-            leaf_ids[dst] = static_cast<LeafIdT>(id);
-            ++counts[id];
+        // Per-lane: classify the truncated quantize, hand the id to the
+        // caller. The signed→unsigned wrap test reuses `quantize_one`'s
+        // single-cmp OOD trick (see its docstring).
+        auto resolve_one = [&](std::int64_t qi) -> std::uint32_t {
+            return (static_cast<std::uint64_t>(qi) > mask)
+                       ? ood_id
+                       : leaf_table_[static_cast<std::size_t>(qi)];
         };
 
-        alignas(aligned) std::array<value_type, lanes> q_arr{};
         const std::size_t n_simd = (n / lanes) * lanes;
-        for (std::size_t i = 0; i < n_simd; i += lanes) {
-            const auto x_v = batch_t::load_unaligned(xp + i);
-            ((x_v - lo_v) * inv_v).store_aligned(q_arr.data());
-            for (std::size_t j = 0; j < lanes; ++j)
-                place_one(i + j, static_cast<std::int64_t>(q_arr[j]));
+
+        if constexpr (kFastTruncateInt64) {
+            // AVX-512DQ path: one `vcvttpd2qq` per W lanes replaces W
+            // scalar `vcvttsd2si`. xsimd::batch_cast picks the fast
+            // intrinsic via `fast_cast` ADL on this arch.
+            using ibatch_t = xsimd::batch<std::int64_t, typename batch_t::arch_type>;
+            static_assert(ibatch_t::size == lanes,
+                          "int64 batch must match double batch lane count");
+            alignas(aligned) std::array<std::int64_t, lanes> q_arr{};
+            for (std::size_t i = 0; i < n_simd; i += lanes) {
+                const auto x_v = batch_t::load_unaligned(xp + i);
+                xsimd::batch_cast<std::int64_t>((x_v - lo_v) * inv_v)
+                    .store_aligned(q_arr.data());
+                for (std::size_t j = 0; j < lanes; ++j)
+                    on_id(i + j, resolve_one(q_arr[j]));
+            }
+        } else {
+            alignas(aligned) std::array<value_type, lanes> q_arr{};
+            for (std::size_t i = 0; i < n_simd; i += lanes) {
+                const auto x_v = batch_t::load_unaligned(xp + i);
+                ((x_v - lo_v) * inv_v).store_aligned(q_arr.data());
+                for (std::size_t j = 0; j < lanes; ++j)
+                    on_id(i + j, resolve_one(static_cast<std::int64_t>(q_arr[j])));
+            }
         }
+        // Scalar tail uses per-lane truncate on every arch (saves the
+        // SIMD load when n_simd<n implies n < lanes).
         for (std::size_t i = n_simd; i < n; ++i)
-            place_one(i, static_cast<std::int64_t>(
-                            (xp[i] - lower_[0]) * inv_span_bins_[0]));
+            on_id(i, resolve_one(static_cast<std::int64_t>(
+                                     (xp[i] - lower_[0]) * inv_span_bins_[0])));
     }
 
     [[nodiscard]] BAOBZI_ALWAYS_INLINE auto
     find_leaf_id_with_ood(const input_type &x, std::uint32_t ood_id) const -> std::uint32_t {
-        const std::size_t bits = leaf_table_depth_;
-        const std::size_t mask = (std::size_t{1} << bits) - 1;
-        std::size_t idx = 0;
-        if constexpr (input_dim == 1) {
-            const auto q0 = static_cast<std::int64_t>(
-                (x - lower_[0]) * inv_span_bins_[0]);
-            if (static_cast<std::uint64_t>(q0) > mask) [[unlikely]] return ood_id;
-            idx = static_cast<std::size_t>(q0);
-        } else {
-            for (std::size_t d = 0; d < input_dim; ++d) {
-                const auto qd = static_cast<std::int64_t>(
-                    (x[d] - lower_[d]) * inv_span_bins_[d]);
-                if (static_cast<std::uint64_t>(qd) > mask) [[unlikely]] return ood_id;
-                idx |= static_cast<std::size_t>(qd) << (bits * d);
-            }
-        }
-        return leaf_table_[idx];
+        return quantize_one(x, ood_id);
     }
 
 
