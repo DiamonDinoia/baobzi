@@ -18,7 +18,21 @@ Python / MATLAB bindings. The fit/eval code path is built directly on
 [polyfit](https://github.com/DiamonDinoia/polyfit) for the leaf polynomials
 and [POET](https://github.com/DiamonDinoia/POET) for compile-time dispatch.
 
+## Install
+
+```bash
+git clone https://github.com/flatironinstitute/baobzi.git
+cmake -S baobzi -B baobzi/build -DCMAKE_BUILD_TYPE=Release
+cmake --build baobzi/build -j 8
+```
+
+Header-only — no install step is needed beyond pointing your include path
+at `baobzi/include`. See [Building](#building) for the test build.
+
 ## Quick start
+
+A minimal 1D fit + scalar `operator()` (full file at
+[`examples/c++/simple1d.cpp`](examples/c++/simple1d.cpp)):
 
 ```cpp
 #include <baobzi/baobzi.hpp>
@@ -90,6 +104,26 @@ target_include_directories(your_target PRIVATE extern/baobzi/include)
 
 Baobzi itself is header-only; polyfit and POET provide the leaf evaluators
 and compile-time dispatch.
+
+## Driving the SIMD-quantize fast path
+
+`PolyTree::find_leaf_id` has a SIMD-quantize + table-lookup fast path:
+one `vcvttpd2qq` (or scalar `vcvttsd2si`) per point plus one `uint32_t`
+load from a `2^(input_dim * D)`-entry table, in place of recursive tree
+descent. The table is built automatically when `input_dim * D <= 16`
+bits of leaf index *and* the BFS produced a single subtree with uniform
+refinement at depth `D`. The batch path's scatter loop then recomputes
+the leaf id in place of a materialised `leaf_ids[]` buffer.
+
+For smooth functions, tol-based refinement usually stops early and the
+tree never reaches uniform depth — the fast path stays off. Two ways to
+drive it on deliberately: tighten `tol` until refinement is uniform, or
+set `options::min_uniform_depth` explicitly to force BFS to refine to a
+known floor before the tolerance test exits. `Function::print_stats()`
+reports `Leaf table: live (N entries, K KiB)` or `Leaf table: descent-only`.
+Tradeoff: table memory grows as `2^(input_dim * D) * 4 B` (capped at
+~256 KiB; past that the table is skipped) and build time is linear in
+`2^(input_dim * D)` function evaluations.
 
 ## Thread safety
 

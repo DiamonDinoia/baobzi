@@ -6,24 +6,25 @@
 ///        approximator. Built on polyfit's leaf evaluators; baobzi adds the
 ///        adaptive tree (paneling) layer on top.
 ///
-/// Thread safety. Once `baobzi::fit(...)` returns, the resulting Function is
-/// immutable and its `operator()` is safe to call concurrently from multiple
-/// threads, provided each call writes to a disjoint output slice. The batch
-/// path allocates and frees its scratch buffers on each call (stack-local
-/// owning `unique_ptr<T[]>`), so nothing on the eval path mutates shared
-/// state. Baobzi does not parallelize internally — callers chunk their
-/// inputs and spawn threads themselves; this contract makes that pattern
-/// safe. See `tests/test_threadsafe.cpp`.
+/// Thread safety. Once `baobzi::fit(...)` returns, the resulting Function
+/// is immutable through its `operator()` overloads, which are safe to call
+/// concurrently from multiple threads provided each call writes to a
+/// disjoint output slice. The batch path allocates and frees its scratch
+/// on each call via the caller-supplied allocator (default
+/// `std::allocator<value_type>`); no state is carried between calls.
+/// Callers that want pooled reuse should pass a stateful allocator —
+/// `std::pmr::polymorphic_allocator` over a `monotonic_buffer_resource`
+/// is the idiomatic choice. See `tests/test_threadsafe.cpp`.
 ///
 /// Memory cost. Tightening `tol`, raising `max_depth`, raising
 /// `max_memory_mib`, or enabling `allow_max_depth_leaves` all increase the
 /// leaf count `L`. The Function holds one persistent allocation: the tree
 /// itself, `O(L)`, shared by all threads and reported by
-/// `Function::print_stats()` / `memory_usage()`. Batch-eval scratch is
-/// allocated and freed inside each `operator()(xp, res, n)` call; its
-/// per-call peak is roughly `tile_K * (8 + (input_dim + output_dim) *
-/// sizeof(value_type))` plus `8 * (L + 1)` bytes, with
-/// `tile_K = max(65536, 32 * L)`.
+/// `Function::print_stats()` / `memory_usage()`. Each batch call
+/// allocates a stack-local scratch of roughly
+/// `tile_K * (4 + (input_dim + output_dim) * sizeof(value_type))` plus
+/// `4 * (L + 1)` bytes (with `tile_K = max(65536, 32 * L)`) and frees it
+/// on return.
 
 #include <array>
 #include <concepts>
@@ -36,18 +37,6 @@
 #include <polyfit/polyfit.hpp>
 
 #include <baobzi/detail/eval_policy.hpp>
-
-namespace baobzi {
-
-/// Tag for `Function::operator()` overloads that promise the input is
-/// already sorted by ascending coordinate. 1D only — leaf-id sequences
-/// are monotone non-decreasing under that promise, so the batch path
-/// can stream points directly into per-leaf SIMD eval without a
-/// counting-sort + scatter + permute round-trip.
-struct sorted_t { explicit sorted_t() = default; };
-inline constexpr sorted_t Sorted{};
-
-} // namespace baobzi
 
 #include <baobzi/detail/function_impl.hpp>
 

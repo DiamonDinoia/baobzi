@@ -40,7 +40,7 @@ set(CPM_xsimd_SOURCE "${_baobzi_xsimd_fork}" CACHE PATH "" FORCE)
 FetchContent_Declare(
     polyfit
     GIT_REPOSITORY https://github.com/DiamonDinoia/polyfit.git
-    GIT_TAG        bccda2f58b7cba202f74c13d633a589b1f119d24
+    GIT_TAG        828582f2523678d206b2f76281088237427ff5b3
     SYSTEM
 )
 set(POLYFIT_BUILD_TESTS    OFF CACHE BOOL "" FORCE)

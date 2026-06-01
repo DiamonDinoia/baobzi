@@ -127,8 +127,6 @@ class Value {
         }
     }
 
-    [[nodiscard]] auto get() const -> storage_t { return data_; }
-
     operator T() const {
         static_assert(N == 1, "Can only cast to scalar if N == 1");
         return data_;
@@ -137,15 +135,6 @@ class Value {
     operator std::array<T, N>() const {
         if constexpr (N == 1) return std::array<T, 1>{data_};
         else                  return data_;
-    }
-
-    [[nodiscard]] auto scalar() const -> const T & {
-        static_assert(N == 1, "Not a scalar");
-        return data_;
-    }
-    [[nodiscard]] auto array() const -> const std::array<T, N> & {
-        static_assert(N != 1, "Not an array");
-        return data_;
     }
 
     /// Always-array view: useful for passing the underlying coordinates to

@@ -65,23 +65,23 @@ auto tail_error_below_tolerance(TolKind tol_type, double tol,
     constexpr std::size_t input_dim  = value_dim_v<typename Polyfit::InputType>;
     constexpr std::size_t output_dim = value_dim_v<typename Polyfit::OutputType>;
     using T = poly_eval::detail::value_type_or_t<typename Polyfit::InputType>;
-    if constexpr (input_dim != 1)
-        throw std::runtime_error(
-            "Baobzi fit error: tail_error check is currently only implemented for 1D input; "
-            "use a sample-based tol_type (RELATIVE_MAX, ABSOLUTE_MAX, RELATIVE_L2, ABSOLUTE_L2) instead");
+    // ND / array-output never reaches here: the sole caller (node.hpp) gates
+    // this behind `if constexpr (kTailErrorSupported)`, which is true only for
+    // scalar→scalar fits. The static_asserts document that contract and turn
+    // any stray ND instantiation into a compile error rather than dead code.
+    static_assert(input_dim == 1,
+                  "tail_error check is only implemented for 1D scalar input; "
+                  "use a sample-based tol_type for array-valued or ND fits");
+    static_assert(output_dim == 1, "tail_error only implemented for single output in 1D");
 
     T maxcoeff{0.0};
     T scaling_factor{1.0};
 
-    if constexpr (input_dim == 1) {
-        const auto &coeffs = polyfit.coeffs();
-        constexpr std::size_t N = Polyfit::NCOEFFS;
-        static_assert(output_dim == 1, "tail_error only implemented for single output in 1D");
-
-        for (std::size_t i = 0; i < 2; ++i)
-            maxcoeff = std::max(std::abs(coeffs[i]), maxcoeff);
-        scaling_factor = std::max(scaling_factor, std::abs(coeffs[N - 1]));
-    }
+    const auto &coeffs = polyfit.coeffs();
+    constexpr std::size_t N = Polyfit::NCOEFFS;
+    for (std::size_t i = 0; i < 2; ++i)
+        maxcoeff = std::max(std::abs(coeffs[i]), maxcoeff);
+    scaling_factor = std::max(scaling_factor, std::abs(coeffs[N - 1]));
 
     if (tol_type == TolKind::RelativeL2 || tol_type == TolKind::RelativeMax)
         return maxcoeff / scaling_factor > tol;

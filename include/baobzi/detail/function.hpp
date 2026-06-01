@@ -32,8 +32,6 @@
 
 namespace baobzi {
 
-struct sorted_t;  // Tag type — defined in <baobzi/baobzi.hpp>; passed by value, never dereferenced.
-
 /// Adaptive piecewise-Chebyshev approximation of a user function. The fit
 /// is materialized at construction (via `baobzi::fit`) into a flat array of
 /// subtrees over a uniform top-level grid, each subtree built BFS to the
@@ -354,10 +352,12 @@ class Function {
     /// Functions would otherwise starve the polyfit batch kernel.
     static constexpr std::size_t kDefaultTileK = 65536;
 
-    /// Reusable, optionally allocator-aware scratch for the unsorted
-    /// batch path. Callers in hot loops can construct one `Scratch` per
-    /// thread and hand it to `operator()(xp, res, n, Scratch&)` to skip
-    /// the per-call allocation that the no-scratch overload performs.
+  private:
+    /// Internal scratch for the unsorted batch path. Constructed
+    /// stack-local inside each batch call (the public API does not
+    /// expose this type) and parametrised on the caller's allocator so
+    /// arena / pool / pinned-memory allocators reuse storage without
+    /// baobzi having to hold any state across calls.
     ///
     /// Leaf ids are not materialised — they are recomputed during
     /// scatter from the same SIMD quantize that drove the histogram
@@ -369,15 +369,6 @@ class Function {
     /// and the scatter cursor — after scatter, `counts[k]` is the
     /// one-past-end of leaf k's packed slice (Reinecke's trick),
     /// removing the need for a separate `offsets` array.
-    ///
-    /// Templated on `Allocator` so users can plug in
-    /// `xsimd::aligned_allocator`, `std::pmr::polymorphic_allocator`,
-    /// pinned-memory allocators, etc. The allocator is rebound
-    /// internally to each buffer's element type via
-    /// `std::allocator_traits::rebind_alloc`.
-    ///
-    /// Not thread-safe: a single `Scratch` may be used by at most one
-    /// concurrent batch call. Build one per thread.
     template <class Allocator = std::allocator<value_type>>
     class Scratch {
         using ATraits = std::allocator_traits<Allocator>;
@@ -423,41 +414,24 @@ class Function {
         };
 
       public:
-        using allocator_type = Allocator;
-
         Scratch() = default;
         explicit Scratch(const Allocator &a)
             : perm_inv_(a), xp_packed_(a), out_packed_(a), counts_(a) {}
 
-        /// Size the scratch for a batch path that will process at most
-        /// `n_max` points against `fn`. Re-callable: shrinks never, grows
-        /// when needed. The reservation accounts for both the per-tile
-        /// working set (`min(n_max, kDefaultTileK)`-sized buffers) and
-        /// the per-Function `counts` table (`n_leaves + 1`). Buffers are
-        /// allocated uninitialised (no value-init) — same semantics as
-        /// `std::make_unique_for_overwrite` for the default allocator.
-        Scratch(const Function &fn, std::size_t n_max,
-                const Allocator &a = Allocator{}) : Scratch(a) {
-            reserve(fn, n_max);
-        }
-
         void reserve(const Function &fn, std::size_t n_max) {
             const auto n_leaves = static_cast<std::uint32_t>(fn.polyfits_.size());
-            const std::size_t tile_cap = std::min(
+            const std::size_t want = std::min(
                 n_max, std::max(kDefaultTileK, fn.polyfits_.size() * 32));
+            // Grow-only on the per-tile cap. The SoA reinterpretation
+            // of `out_packed_` indexes off `tile_cap_`, so quietly
+            // lowering it would alias the per-component spans onto the
+            // wrong half of the buffer on the next call.
+            const std::size_t tile_cap = std::max(tile_cap_, want);
             perm_inv_  .ensure_size(tile_cap);
             xp_packed_ .ensure_size(input_dim  * tile_cap);
             out_packed_.ensure_size(output_dim * tile_cap);
             counts_    .ensure_size(std::size_t{n_leaves} + 1);
-        }
-
-        /// Release all memory. Object stays usable; the next `reserve`
-        /// (explicit or via the batch overload) will reallocate.
-        void clear() noexcept {
-            perm_inv_.reset();
-            xp_packed_.reset();
-            out_packed_.reset();
-            counts_.reset();
+            tile_cap_  = tile_cap;
         }
 
       private:
@@ -467,33 +441,20 @@ class Function {
         Buf<value_type>       xp_packed_;
         Buf<value_type>       out_packed_;
         Buf<std::uint32_t>    counts_;
+        std::size_t           tile_cap_ = 0;
 
         [[nodiscard]] auto perm_inv()   noexcept { return perm_inv_.data(); }
         [[nodiscard]] auto xp_packed()  noexcept { return xp_packed_.data(); }
         [[nodiscard]] auto out_packed() noexcept { return out_packed_.data(); }
         [[nodiscard]] auto counts()     noexcept { return counts_.data(); }
+        // SoA reinterpretation of `out_packed_`: OutputDim contiguous spans
+        // of `tile_cap_` elements each. Each leaf's range [off, off+cnt)
+        // in component d lives at out_soa_base(d) + off.
+        [[nodiscard]] auto out_soa_base(std::size_t d) noexcept
+            -> value_type * { return out_packed_.data() + d * tile_cap_; }
     };
 
-    /// Type-safe Scratch factory. Equivalent to `Scratch<Alloc>(*this, n_max, a)`
-    /// but reads cleaner at the call site:
-    ///
-    /// \code
-    ///   auto fn = baobzi::fit(...);
-    ///   auto s  = fn.make_scratch(n_max);             // default allocator
-    ///   auto s2 = fn.make_scratch<MyAlloc>(n_max, a); // custom allocator
-    ///   fn(xp, res, n, s);
-    /// \endcode
-    ///
-    /// The returned Scratch can be shared across other Functions of the
-    /// same template instantiation (sized to the largest n_max / leaf
-    /// count needed). Build one per thread for thread safety.
-    template <class Allocator = std::allocator<value_type>>
-    [[nodiscard]] auto make_scratch(std::size_t n_max,
-                                    const Allocator &a = Allocator{}) const
-        -> Scratch<Allocator> {
-        return Scratch<Allocator>(*this, n_max, a);
-    }
-
+  public:
     /// Batch evaluation: `n_trg` points written into `res`.
     ///
     /// Pipeline (unsorted, the general path):
@@ -534,41 +495,104 @@ class Function {
     /// adaptive floor for high-leaf-count Functions) so the packed buffers
     /// fit in L1d/L2.
     ///
-    /// For 1D, callers who can promise sortedness should prefer the
-    /// `(xp, res, n, baobzi::Sorted)` overload — it skips stages 2, 3, 5
-    /// entirely and runs ~3–4× faster.
+    /// For 1D, callers who can promise sortedness should prefer
+    /// `sorted(xp, res, n)` — it skips stages 2, 3, 5 entirely and
+    /// runs ~3–4× faster.
     ///
     /// Thread-safe: a single Function may be called concurrently from
     /// multiple threads provided each call's `xp` and `res` slices do not
-    /// overlap with another thread's. Scratch is allocated and freed
-    /// inside each batch call (stack-local owning buffers); the
-    /// Function's internal state (nodes, polyfits) is immutable after
-    /// construction. Pinned by `tests/test_threadsafe.cpp`.
-    /// @param xp     `n_trg * input_dim` packed input coordinates.
-    /// @param res    `n_trg * output_dim` output buffer.
-    /// @param n_trg  number of points to evaluate.
-    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res, std::size_t n_trg) const -> void {
-        Scratch<> s;
+    /// overlap with another thread's. Scratch buffers are allocated
+    /// (via `allocator`, default `std::allocator<value_type>`) on entry
+    /// and freed on return — no state is carried between calls. Callers
+    /// that want pooled reuse should pass a stateful allocator (e.g.
+    /// `std::pmr::polymorphic_allocator` over a monotonic buffer).
+    /// Pinned by `tests/test_threadsafe.cpp`.
+    /// @param xp         `n_trg * input_dim` packed input coordinates.
+    /// @param res        `n_trg * output_dim` output buffer.
+    /// @param n_trg      number of points to evaluate.
+    /// @param allocator  allocator for the per-call scratch (optional).
+    template <class Allocator = std::allocator<value_type>>
+    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res,
+                                   std::size_t n_trg,
+                                   const Allocator &allocator = {}) const -> void {
+        Scratch<Allocator> s(allocator);
         eval_batch(xp, res, n_trg, s);
     }
 
-    /// Caller-scratch batch evaluation. Same semantics as
-    /// `operator()(xp, res, n_trg)` but reuses `scratch` across calls,
-    /// avoiding the per-call allocation of the no-scratch overload. The
-    /// scratch grows on demand; pre-size with
-    /// `Scratch<>(fn, n_max)` or `s.reserve(fn, n_max)` if you know the
-    /// peak batch size up-front.
+    /// SoA-output batch evaluation. Same pipeline as the AoS overload but
+    /// writes each output component into its own stride-1 buffer
+    /// (`soa_out[d][k]` is point k's component d) instead of an interleaved
+    /// `[c0 c1 ... cD-1 c0 c1 ...]` stream in a single buffer. Delegates
+    /// to polyfit's SoA P2 overload (`FuncEvalND::operator()(pts, soa,
+    /// count)`) so the per-leaf kernel writes SoA natively — no AoS
+    /// materialise + deinterleave detour. Each `soa_out[d]` must hold
+    /// `n_trg` elements.
     ///
-    /// `Allocator` is the policy knob: pass `xsimd::aligned_allocator`
-    /// for an over-aligned scratch, `std::pmr::polymorphic_allocator`
-    /// for arena reuse, pinned-memory allocators for CUDA interop, …
-    template <class Allocator>
-    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res,
-                                   std::size_t n_trg, Scratch<Allocator> &scratch) const -> void {
-        eval_batch(xp, res, n_trg, scratch);
+    /// Only available when `output_dim > 1` — for scalar outputs the AoS
+    /// and SoA layouts coincide, so the AoS overload is the canonical
+    /// entry point.
+    template <class Allocator = std::allocator<value_type>>
+    BAOBZI_FLATTEN auto operator()(const value_type *xp,
+                                   std::array<value_type *, output_dim> soa_out,
+                                   std::size_t n_trg,
+                                   const Allocator &allocator = {}) const -> void
+        requires (output_dim > 1)
+    {
+        Scratch<Allocator> s(allocator);
+        eval_batch_soa(xp, soa_out, n_trg, s);
     }
 
   private:
+    template <class Allocator>
+    BAOBZI_FLATTEN auto eval_batch_soa(const value_type *xp,
+                                       std::array<value_type *, output_dim> soa_out,
+                                       std::size_t n_trg, Scratch<Allocator> &s) const -> void {
+        if (n_trg == 0) [[unlikely]] return;
+        if (n_trg == 1) [[unlikely]] {
+            const detail::Value<value_type, input_dim> xi(xp);
+            const detail::Value<value_type, output_dim> tmp = (*this)(xi);
+            poet::static_for<output_dim>([&](auto D) -> void {
+                constexpr std::size_t d = D;
+                soa_out[d][0] = tmp[d];
+            });
+            return;
+        }
+
+        constexpr std::size_t kSortThreshold = 32;
+        if (n_trg < kSortThreshold) {
+            for (std::size_t i_trg = 0; i_trg < n_trg; ++i_trg) {
+                const detail::Value<value_type, input_dim> xi(xp + (input_dim * i_trg));
+                const detail::Value<value_type, output_dim> tmp = (*this)(xi);
+                poet::static_for<output_dim>([&](auto D) -> void {
+                    constexpr std::size_t d = D;
+                    soa_out[d][i_trg] = tmp[d];
+                });
+            }
+            return;
+        }
+
+        constexpr std::size_t kMinPtsPerLeaf = 32;
+        const std::size_t tile_K =
+            std::max(kDefaultTileK, polyfits_.size() * kMinPtsPerLeaf);
+
+        s.reserve(*this, std::min(n_trg, tile_K));
+
+        if (n_trg > tile_K) {
+            for (std::size_t tile_off = 0; tile_off < n_trg; tile_off += tile_K) {
+                const std::size_t tile_n = std::min(tile_K, n_trg - tile_off);
+                std::array<value_type *, output_dim> tile_soa{};
+                poet::static_for<output_dim>([&](auto D) -> void {
+                    constexpr std::size_t d = D;
+                    tile_soa[d] = soa_out[d] + tile_off;
+                });
+                eval_batch_tile_soa(xp + (input_dim * tile_off),
+                                    tile_soa, tile_n, s);
+            }
+            return;
+        }
+        eval_batch_tile_soa(xp, soa_out, n_trg, s);
+    }
+
     template <class Allocator>
     BAOBZI_FLATTEN auto eval_batch(const value_type *xp, value_type *res,
                                    std::size_t n_trg, Scratch<Allocator> &s) const -> void {
@@ -601,16 +625,6 @@ class Function {
         const std::size_t tile_K =
             std::max(kDefaultTileK, polyfits_.size() * kMinPtsPerLeaf);
 
-        // Debug-only check: warn loudly if a pre-sized Scratch is
-        // undersized for this Function. The reserve() below still
-        // auto-grows transparently, so this is a perf-surprise guard,
-        // not a correctness guard.
-        assert((s.counts_.size() == 0
-                || s.counts_.size() >= polyfits_.size() + 1)
-               && "baobzi::Scratch reserved for a smaller Function — "
-                  "this call will silently re-allocate. Reuse a Scratch "
-                  "only across Functions sized at least as large.");
-
         // Scratch is grown to one tile (idempotent if already sized) and
         // reused across tiles. Only `counts` needs zeroing between tiles;
         // the other buffers are write-before-read on every tile.
@@ -641,10 +655,10 @@ class Function {
     ///     kernel writing straight into `res + i`.
     ///
     /// No `leaf_ids` write, no counts/prefix-sum, no scatter into
-    /// `xp_packed`, no permute back from `out_packed`, no `thread_local`
-    /// scratch — the input and output buffers themselves are the packed
-    /// layout, and the run-length scan amortizes the per-leaf eval as
-    /// well as the counting sort did.
+    /// `xp_packed`, no permute back from `out_packed`, no scratch
+    /// allocation at all — the input and output buffers themselves
+    /// are the packed layout, and the run-length scan amortizes the
+    /// per-leaf eval as well as the counting sort did.
     ///
     /// OOD points form a contiguous prefix and/or suffix (since the
     /// input is sorted) and are NaN-filled by two short guards around
@@ -660,23 +674,84 @@ class Function {
     /// `res` must hold `n * output_dim` elements. Restricted to
     /// `input_dim == 1`: 2D/3D leaf-id sequences are not monotone under
     /// single-axis sorting so the same trick does not apply.
-    /// Sorted+Scratch overload — convenience for hot loops that reuse a
-    /// single `Scratch` across mixed sorted and unsorted batch calls.
-    /// The sorted path allocates nothing internally, so `scratch` is
-    /// unused here; it's accepted purely for API symmetry with the
-    /// unsorted `(xp, res, n, Scratch&)` overload.
-    template <class Allocator>
-    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res,
-                                   std::size_t n,
-                                   [[maybe_unused]] Scratch<Allocator> &scratch,
-                                   sorted_t s) const -> void
-        requires (input_dim == 1)
+    /// Sorted-input + SoA output (1D). Same monotone-leaf-id trick as
+    /// the AoS sorted path, but each per-leaf run dispatches to
+    /// polyfit's SoA P2 overload and writes straight into the caller's
+    /// per-component buffers — no permute, no scatter. Only available
+    /// when `output_dim > 1`; for scalar outputs the AoS `sorted(...)`
+    /// is canonical.
+    BAOBZI_FLATTEN auto sorted(const value_type *xp,
+                               std::array<value_type *, output_dim> soa_out,
+                               std::size_t n) const -> void
+        requires (input_dim == 1 && output_dim > 1)
     {
-        (*this)(xp, res, n, s);
+        if (n == 0) [[unlikely]] return;
+
+        constexpr value_type nan_v = std::numeric_limits<value_type>::quiet_NaN();
+        auto write_nan = [&](std::size_t i) -> void {
+            poet::static_for<output_dim>([&](auto D) -> void {
+                constexpr std::size_t d = D;
+                soa_out[d][i] = nan_v;
+            });
+        };
+
+        const auto n_leaves = static_cast<std::uint32_t>(polyfits_.size());
+        const std::uint32_t ood_id = n_leaves;
+        const bool fast = subtrees_.size() == 1 && subtrees_.front().has_leaf_table();
+
+        auto x_in = [&](std::size_t i) -> input_type {
+            if constexpr (poly_eval::detail::hasTupleSize_v<input_type>)
+                return input_type{xp[i]};
+            else
+                return xp[i];
+        };
+
+        auto leaf_id_at = [&](std::size_t i) -> std::uint32_t {
+            if (fast)
+                return subtrees_.front().find_leaf_id_with_ood(x_in(i), ood_id);
+            const value_type xv = xp[i];
+            if (xv < lower_left_[0] || xv >= upper_right_[0])
+                return ood_id;
+            const auto x = x_in(i);
+            return subtrees_[get_linear_bin(x)].find_leaf_id(x);
+        };
+
+        std::size_t i = 0;
+        while (i < n && xp[i] < lower_left_[0]) { write_nan(i); ++i; }
+
+        while (i < n) {
+            if (xp[i] >= upper_right_[0]) [[unlikely]] {
+                do { write_nan(i); ++i; } while (i < n);
+                break;
+            }
+            const std::uint32_t id = leaf_id_at(i);
+            if (id == ood_id) [[unlikely]] {
+                write_nan(i); ++i;
+                continue;
+            }
+            std::size_t j = i + 1;
+            while (j < n && leaf_id_at(j) == id) ++j;
+
+            if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) {
+                using CI = typename poly_eval_type::CanonicalInput;
+                std::array<value_type *, output_dim> run_soa{};
+                poet::static_for<output_dim>([&](auto D) -> void {
+                    constexpr std::size_t d = D;
+                    run_soa[d] = soa_out[d] + i;
+                });
+                polyfits_[id](reinterpret_cast<const CI *>(xp + i),
+                              run_soa, j - i);
+            } else {
+                static_assert(output_dim == 1,
+                              "scalar-input fits are 1-output by construction");
+                polyfits_[id](xp + i, soa_out[0] + i, j - i);
+            }
+            i = j;
+        }
     }
 
-    BAOBZI_FLATTEN auto operator()(const value_type *xp, value_type *res,
-                                   std::size_t n, sorted_t) const -> void
+    BAOBZI_FLATTEN auto sorted(const value_type *xp, value_type *res,
+                               std::size_t n) const -> void
         requires (input_dim == 1)
     {
         if (n == 0) [[unlikely]] return;
@@ -691,11 +766,6 @@ class Function {
         const std::uint32_t ood_id = n_leaves;
         const bool fast = subtrees_.size() == 1 && subtrees_.front().has_leaf_table();
 
-        // input_type is either `value_type` (scalar 1D) or
-        // `std::array<value_type, 1>` (array-spelled 1D). The leaf-find
-        // helpers below take `input_type&` so we wrap `xp[i]` accordingly;
-        // the wrapper has no runtime cost — the optimiser drops the
-        // single-element brace-init.
         auto x_in = [&](std::size_t i) -> input_type {
             if constexpr (poly_eval::detail::hasTupleSize_v<input_type>)
                 return input_type{xp[i]};
@@ -753,54 +823,66 @@ class Function {
         }
     }
 
-    /// Per-tile body of the unsorted batch pipeline (stages 1–5, see the
-    /// `operator()(xp, res, n)` doc above). The caller ensures
-    /// `n_trg >= kSortThreshold` and `n_trg <= tile_K`, and owns the
-    /// scratch buffers (sized to one tile, reused across tiles).
-    template <class Allocator>
-    auto eval_batch_tile(const value_type *xp, value_type *res,
-                         std::size_t n_trg, Scratch<Allocator> &s) const -> void {
-        const auto n_leaves = static_cast<std::uint32_t>(polyfits_.size());
-        const std::uint32_t ood_id = n_leaves; // sentinel bucket for out-of-domain
+    /// Per-point leaf-id lookup with out-of-domain handling, shared by the
+    /// AoS and SoA unsorted tile partitions (via `partition_into_leaves`).
+    /// `table` is the hoisted `subtrees_.size() == 1 && front().has_leaf_table()`
+    /// invariant, passed in so the per-point loop never re-derives it.
+    /// ALWAYS_INLINE so every call site folds back to the open-coded lookup
+    /// (codegen verified).
+    ///
+    /// The `sorted` paths deliberately do NOT call this: their bespoke scalar
+    /// early-return OOD check compiles to a tighter 1D loop than this generic
+    /// flag+ternary form, and unifying them was shown (objdump) to grow and
+    /// reorder the `sorted` hot loop. Keep the two forms separate.
+    BAOBZI_ALWAYS_INLINE auto
+    leaf_id_of(const detail::Value<value_type, input_dim> &xi,
+               std::uint32_t ood_id, bool table) const -> std::uint32_t {
+        if (table)
+            return subtrees_.front().find_leaf_id_with_ood(xi, ood_id);
+        bool in_domain = true;
+        poet::static_for<input_dim>([&](auto D) -> void {
+            constexpr std::size_t d = D;
+            if (xi[d] < lower_left_[d] || xi[d] >= upper_right_[d])
+                in_domain = false;
+        });
+        return in_domain ? subtrees_[get_linear_bin(xi)].find_leaf_id(xi)
+                         : ood_id;
+    }
 
-        auto *perm_inv   = s.perm_inv();
-        auto *xp_packed  = s.xp_packed();
-        auto *out_packed = s.out_packed();
-        auto *counts     = s.counts();
+    /// Stages 1–3 of the unsorted tile pipeline, shared (byte-identical)
+    /// between the AoS and SoA tile bodies: zero `counts`, histogram leaf
+    /// populations, exclusive-scan into slice starts, then scatter each
+    /// point's coords into `xp_packed` while recording the inverse
+    /// permutation in `perm_inv`. On return `counts[k]` is leaf k's
+    /// one-past-end cursor (Reinecke) — enough to recover (off, cnt) per leaf
+    /// in the dispatch walk.
+    ///
+    /// No leaf-id array is materialised: the 1D leaf-table fast path amortises
+    /// the quantize over an xsimd batch (`for_each_leaf_id_batch`, FINUFFT
+    /// bin-sort recon, spread.hpp:421) in both passes; the ND / multi-subtree
+    /// path keeps the per-point `leaf_id_of` loop. Pass 2 re-quantizes rather
+    /// than reading a stored `leaf_ids[]`, trading one SIMD quantize per W
+    /// points for the L1d round trip the materialised array would impose.
+    template <class Allocator>
+    BAOBZI_ALWAYS_INLINE auto
+    partition_into_leaves(const value_type *xp, std::size_t n_trg,
+                          Scratch<Allocator> &s, std::uint32_t ood_id) const -> void {
+        const std::uint32_t n_leaves = ood_id; // sentinel id == n_leaves
+        auto *perm_inv  = s.perm_inv();
+        auto *xp_packed = s.xp_packed();
+        auto *counts    = s.counts();
 
         // `counts` is the only scratch buffer that needs reset between
         // tiles — the others are write-before-read.
         std::memset(counts, 0, (n_leaves + 1) * sizeof(std::uint32_t));
 
-        // Helper: per-point id lookup with OOD handling, dispatched on
-        // whether the (only) subtree owns a leaf table (the common
-        // compact-domain case). Inlined into both passes below — same
-        // call shape, no `leaf_ids[]` array materialised in between.
-        const bool one_subtree_table =
+        const bool table =
             subtrees_.size() == 1 && subtrees_.front().has_leaf_table();
-        auto id_of_xi = [&](const detail::Value<value_type, input_dim> &xi)
-            -> std::uint32_t {
-            if (one_subtree_table) {
-                return subtrees_.front().find_leaf_id_with_ood(xi, ood_id);
-            }
-            bool in_domain = true;
-            poet::static_for<input_dim>([&](auto D) -> void {
-                constexpr std::size_t d = D;
-                if (xi[d] < lower_left_[d] || xi[d] >= upper_right_[d])
-                    in_domain = false;
-            });
-            return in_domain ? subtrees_[get_linear_bin(xi)].find_leaf_id(xi)
-                             : ood_id;
-        };
 
-        // Pass 1 — histogram. No leaf-id materialisation: counts is the
-        // only thing that lives past this loop. The 1D fast path amortises
-        // the quantize over an xsimd batch via `for_each_leaf_id_batch`
-        // (FINUFFT bin-sort recon, spread.hpp:421); the ND / multi-subtree
-        // path keeps the per-point loop (stride-`input_dim` SIMD loads or
-        // a transpose would dominate the quantize cost).
+        // Pass 1 — histogram. counts is the only thing that lives past this
+        // loop.
         if constexpr (input_dim == 1) {
-            if (one_subtree_table) {
+            if (table) {
                 subtrees_.front().for_each_leaf_id_batch(
                     xp, ood_id, n_trg,
                     [&](std::size_t /*i*/, std::uint32_t id) {
@@ -809,13 +891,13 @@ class Function {
             } else {
                 for (std::size_t i = 0; i < n_trg; ++i) {
                     const detail::Value<value_type, input_dim> xi(xp + i);
-                    ++counts[id_of_xi(xi)];
+                    ++counts[leaf_id_of(xi, ood_id, table)];
                 }
             }
         } else {
             for (std::size_t i = 0; i < n_trg; ++i) {
                 const detail::Value<value_type, input_dim> xi(xp + (input_dim * i));
-                ++counts[id_of_xi(xi)];
+                ++counts[leaf_id_of(xi, ood_id, table)];
             }
         }
 
@@ -825,13 +907,11 @@ class Function {
         std::exclusive_scan(counts, counts + n_leaves + 1,
                             counts, std::uint32_t{0});
 
-        // Pass 2 — scatter. Re-quantize each point (same SIMD pipeline as
-        // pass 1 for the 1D fast path), look up its leaf id, then place
-        // its coords at `xp_packed[counts[id]++]`. The recompute trades
-        // one SIMD quantize per W points for the L1d round trip a
-        // materialised `leaf_ids[]` would impose between passes.
+        // Pass 2 — scatter. Re-quantize each point, look up its leaf id, then
+        // place its coords at `xp_packed[counts[id]++]` and record the inverse
+        // mapping in `perm_inv`.
         if constexpr (input_dim == 1) {
-            if (one_subtree_table) {
+            if (table) {
                 subtrees_.front().for_each_leaf_id_batch(
                     xp, ood_id, n_trg,
                     [&](std::size_t i, std::uint32_t id) {
@@ -842,7 +922,7 @@ class Function {
             } else {
                 for (std::size_t i = 0; i < n_trg; ++i) {
                     const detail::Value<value_type, input_dim> xi(xp + i);
-                    const std::uint32_t id = id_of_xi(xi);
+                    const std::uint32_t id = leaf_id_of(xi, ood_id, table);
                     const std::uint32_t dst = counts[id]++;
                     perm_inv[i] = dst;
                     xp_packed[dst] = xp[i];
@@ -851,7 +931,7 @@ class Function {
         } else {
             for (std::size_t i = 0; i < n_trg; ++i) {
                 const detail::Value<value_type, input_dim> xi(xp + (input_dim * i));
-                const std::uint32_t id = id_of_xi(xi);
+                const std::uint32_t id = leaf_id_of(xi, ood_id, table);
                 const std::uint32_t dst = counts[id]++;
                 perm_inv[i] = dst;
                 value_type *dstp = xp_packed + (input_dim * dst);
@@ -861,11 +941,19 @@ class Function {
                 });
             }
         }
+    }
 
-        // Per-leaf SIMD batch eval. Walk ids with a running prev_end:
-        // counts[id] is the slice end; cnt = end - prev_end; off = prev_end.
-        // Speculative prefetch of the next non-empty leaf's coefficient
-        // store hides cacheline-fill latency when leaves are small.
+    /// Stage 4 skeleton, shared between the tile bodies. Walk the packed leaf
+    /// slices in id order (recovering each `(off, cnt)` from the Reinecke
+    /// cursor in `counts`), speculatively prefetch the next non-empty leaf's
+    /// coefficient store, and invoke `eval_run(id, off, cnt)` on every
+    /// non-empty leaf. Returns the one-past-end of the last real leaf's slice
+    /// (== the OOD bucket's offset). Only the per-run polyfit dispatch (the
+    /// `eval_run` callable) differs between the AoS and SoA layouts.
+    template <class EvalRun>
+    BAOBZI_ALWAYS_INLINE auto
+    dispatch_packed_leaves(const std::uint32_t *counts, std::uint32_t n_leaves,
+                           EvalRun eval_run) const -> std::uint32_t {
         std::uint32_t prev_end = 0;
         for (std::uint32_t id = 0; id < n_leaves; ++id) {
             const std::uint32_t end = counts[id];
@@ -887,24 +975,52 @@ class Function {
                 }
             }
 #endif
-            if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) {
-                using CI = typename poly_eval_type::CanonicalInput;
-                using CO = typename poly_eval_type::CanonicalOutput;
-                const CI *pts = reinterpret_cast<const CI *>(
-                    xp_packed + (input_dim * off));
-                CO *outs = reinterpret_cast<CO *>(
-                    out_packed + (output_dim * off));
-                polyfits_[id](pts, outs, static_cast<std::size_t>(cnt));
-            } else {
-                polyfits_[id](xp_packed + off,
-                              out_packed + off,
-                              static_cast<std::size_t>(cnt));
-            }
+            eval_run(id, off, cnt);
         }
+        return prev_end;
+    }
+
+    /// Per-tile body of the unsorted batch pipeline (stages 1–5, see the
+    /// `operator()(xp, res, n)` doc above). The caller ensures
+    /// `n_trg >= kSortThreshold` and `n_trg <= tile_K`, and owns the
+    /// scratch buffers (sized to one tile, reused across tiles). Stages 1–3
+    /// run in `partition_into_leaves` and stage 4 in `dispatch_packed_leaves`,
+    /// both shared with the SoA twin; only the interleaved AoS write-back
+    /// (OOD-fill + permute) is spelled here.
+    template <class Allocator>
+    auto eval_batch_tile(const value_type *xp, value_type *res,
+                         std::size_t n_trg, Scratch<Allocator> &s) const -> void {
+        const auto n_leaves = static_cast<std::uint32_t>(polyfits_.size());
+        const std::uint32_t ood_id = n_leaves; // sentinel bucket for out-of-domain
+
+        partition_into_leaves(xp, n_trg, s, ood_id);
+
+        auto *perm_inv   = s.perm_inv();
+        auto *xp_packed  = s.xp_packed();
+        auto *out_packed = s.out_packed();
+        auto *counts     = s.counts();
+
+        // Stage 4 — per-leaf SIMD batch eval into the interleaved out_packed.
+        const std::uint32_t ood_off = dispatch_packed_leaves(
+            counts, n_leaves,
+            [&](std::uint32_t id, std::uint32_t off, std::uint32_t cnt) {
+                if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) {
+                    using CI = typename poly_eval_type::CanonicalInput;
+                    using CO = typename poly_eval_type::CanonicalOutput;
+                    const CI *pts = reinterpret_cast<const CI *>(
+                        xp_packed + (input_dim * off));
+                    CO *outs = reinterpret_cast<CO *>(
+                        out_packed + (output_dim * off));
+                    polyfits_[id](pts, outs, static_cast<std::size_t>(cnt));
+                } else {
+                    polyfits_[id](xp_packed + off,
+                                  out_packed + off,
+                                  static_cast<std::size_t>(cnt));
+                }
+            });
 
         // Fill OOD slots with NaN.
-        const std::uint32_t ood_off = prev_end;
-        const std::uint32_t ood_cnt = counts[ood_id] - prev_end;
+        const std::uint32_t ood_cnt = counts[ood_id] - ood_off;
         if (ood_cnt) {
             constexpr value_type nan_v = std::numeric_limits<value_type>::quiet_NaN();
             for (std::uint32_t k = 0; k < ood_cnt; ++k)
@@ -931,6 +1047,95 @@ class Function {
             poet::static_for<output_dim>([&](auto J) -> void {
                 constexpr std::size_t j = J;
                 dstp[j] = srcp[j];
+            });
+        }
+    }
+
+    /// SoA-output twin of `eval_batch_tile`. Same five-stage pipeline; the
+    /// only deltas are (a) the per-leaf polyfit call routes through the
+    /// SoA P2 overload (or `FuncEval`'s AoS path when output_dim == 1,
+    /// where SoA and AoS coincide), and (b) the permute-back stage writes
+    /// `soa_out[d][perm_inv_idx]` for each component d instead of an
+    /// interleaved store. The packed working set lives in `out_packed_`
+    /// reinterpreted as OutputDim contiguous spans of `tile_cap()`
+    /// elements (see `Scratch::out_soa_base`).
+    template <class Allocator>
+    auto eval_batch_tile_soa(const value_type *xp,
+                             std::array<value_type *, output_dim> soa_out,
+                             std::size_t n_trg, Scratch<Allocator> &s) const -> void {
+        const auto n_leaves = static_cast<std::uint32_t>(polyfits_.size());
+        const std::uint32_t ood_id = n_leaves;
+
+        partition_into_leaves(xp, n_trg, s, ood_id);
+
+        auto *perm_inv  = s.perm_inv();
+        auto *xp_packed = s.xp_packed();
+        auto *counts    = s.counts();
+
+        // Per-component packed output bases. The SoA reinterpretation of
+        // `out_packed_` — see Scratch::out_soa_base.
+        std::array<value_type *, output_dim> out_soa_packed{};
+        poet::static_for<output_dim>([&](auto D) -> void {
+            constexpr std::size_t d = D;
+            out_soa_packed[d] = s.out_soa_base(d);
+        });
+
+        // Stage 4 — per-leaf SIMD batch eval via the SoA P2 overload
+        // (FuncEvalND) for array-spelled inputs; FuncEval's AoS-batch overload
+        // for scalar 1D where output_dim == 1 collapses SoA and AoS.
+        const std::uint32_t ood_off = dispatch_packed_leaves(
+            counts, n_leaves,
+            [&](std::uint32_t id, std::uint32_t off, std::uint32_t cnt) {
+                if constexpr (poly_eval::detail::hasTupleSize_v<input_type>) {
+                    using CI = typename poly_eval_type::CanonicalInput;
+                    const CI *pts = reinterpret_cast<const CI *>(
+                        xp_packed + (input_dim * off));
+                    std::array<value_type *, output_dim> leaf_soa{};
+                    poet::static_for<output_dim>([&](auto D) -> void {
+                        constexpr std::size_t d = D;
+                        leaf_soa[d] = out_soa_packed[d] + off;
+                    });
+                    polyfits_[id](pts, leaf_soa, static_cast<std::size_t>(cnt));
+                } else {
+                    // Scalar 1D input: output_dim == 1 by construction, so the
+                    // single SoA span IS the packed output buffer.
+                    static_assert(output_dim == 1,
+                                  "scalar-input fits are 1-output by construction");
+                    polyfits_[id](xp_packed + off,
+                                  out_soa_packed[0] + off,
+                                  static_cast<std::size_t>(cnt));
+                }
+            });
+
+        // Fill OOD slots with NaN — per-component stride-1 stores.
+        const std::uint32_t ood_cnt = counts[ood_id] - ood_off;
+        if (ood_cnt) {
+            constexpr value_type nan_v = std::numeric_limits<value_type>::quiet_NaN();
+            poet::static_for<output_dim>([&](auto D) -> void {
+                constexpr std::size_t d = D;
+                value_type *p = out_soa_packed[d] + ood_off;
+                for (std::uint32_t k = 0; k < ood_cnt; ++k) p[k] = nan_v;
+            });
+        }
+
+        // Permute outputs back to caller order — per-component stride-1
+        // stores into `soa_out[d]`.
+        [[maybe_unused]] constexpr std::size_t LOOKAHEAD = 32;
+        for (std::size_t i = 0; i < n_trg; ++i) {
+#if defined(__GNUC__) || defined(__clang__)
+            if (i + LOOKAHEAD < n_trg) {
+                const std::uint32_t pf = perm_inv[i + LOOKAHEAD];
+                poet::static_for<output_dim>([&](auto D) -> void {
+                    constexpr std::size_t d = D;
+                    __builtin_prefetch(out_soa_packed[d] + pf,
+                                       /*rw=*/0, /*locality=*/0);
+                });
+            }
+#endif
+            const std::uint32_t src = perm_inv[i];
+            poet::static_for<output_dim>([&](auto D) -> void {
+                constexpr std::size_t d = D;
+                soa_out[d][i] = out_soa_packed[d][src];
             });
         }
     }

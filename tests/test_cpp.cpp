@@ -269,7 +269,7 @@ TEST_CASE("Sorted-1D batch matches unsorted batch and scalar", "[baobzi][batch][
         std::sort(xs.begin(), xs.end());
 
         std::vector<double> sorted_out(N);
-        fn(xs.data(), sorted_out.data(), N, baobzi::Sorted);
+        fn.sorted(xs.data(), sorted_out.data(), N);
 
         std::vector<double> batch_out(N);
         fn(xs.data(), batch_out.data(), N);
@@ -374,6 +374,72 @@ TEST_CASE("Batch (1D in, 2D out) matches per-point scalar after leaf_ids drop",
                 <= 4.0 * ulp * std::max(1.0, std::abs(single[1])));
     }
 }
+
+// SoA batch overload: same Function, same inputs — assert that
+// aos_out[2*k + d] == soa[d][k] bitwise across both the unsorted and
+// sorted 1D paths. The two paths share the per-leaf polyfit kernel
+// (FuncEvalND P2 AoS vs P2 SoA respectively, both walking the same
+// coefficients with the same arithmetic), so the math is identical and
+// only the store layout differs.
+TEST_CASE("SoA batch overload matches AoS bitwise (1D in, 2D out)",
+          "[baobzi][batch][soa]") {
+    auto f = [](std::array<double, 1> x) -> std::array<double, 2> {
+        return {std::sin(3.0 * x[0]), std::cos(2.5 * x[0] + 0.1)};
+    };
+    auto fn = fit<8>(f, std::array{0.0}, std::array{1.0}, /*tol=*/1e-10);
+
+    std::mt19937 gen(2024);
+    std::uniform_real_distribution<double> d(1e-3, 1.0 - 1e-3);
+    constexpr std::size_t N = 1024; // > kSortThreshold so the batch pipeline runs
+    std::vector<double> xs(N);
+    for (auto &x : xs) x = d(gen);
+
+    SECTION("unsorted (operator()(xp, soa, n))") {
+        std::vector<double> aos(2 * N);
+        fn(xs.data(), aos.data(), N);
+
+        std::vector<double> soa_buf(2 * N);
+        std::array<double *, 2> soa{soa_buf.data(), soa_buf.data() + N};
+        fn(xs.data(), soa, N);
+
+        for (std::size_t k = 0; k < N; ++k) {
+            REQUIRE(aos[2 * k + 0] == soa[0][k]);
+            REQUIRE(aos[2 * k + 1] == soa[1][k]);
+        }
+    }
+
+    SECTION("sorted (fn.sorted(xp, soa, n))") {
+        // Include OOD prefix/suffix to exercise the NaN-fill SoA path.
+        std::vector<double> sxs;
+        sxs.reserve(N + 6);
+        for (int i = 0; i < 3; ++i) sxs.push_back(-1.0 - 0.1 * i);
+        for (auto &x : xs) sxs.push_back(x);
+        for (int i = 0; i < 3; ++i) sxs.push_back(2.0 + 0.1 * i);
+        std::sort(sxs.begin(), sxs.end());
+        const std::size_t M = sxs.size();
+
+        std::vector<double> aos(2 * M);
+        fn.sorted(sxs.data(), aos.data(), M);
+
+        std::vector<double> soa_buf(2 * M);
+        std::array<double *, 2> soa{soa_buf.data(), soa_buf.data() + M};
+        fn.sorted(sxs.data(), soa, M);
+
+        for (std::size_t k = 0; k < M; ++k) {
+            if (std::isnan(aos[2 * k + 0])) {
+                REQUIRE(std::isnan(soa[0][k]));
+                REQUIRE(std::isnan(soa[1][k]));
+            } else {
+                REQUIRE(aos[2 * k + 0] == soa[0][k]);
+                REQUIRE(aos[2 * k + 1] == soa[1][k]);
+            }
+        }
+    }
+
+}
+
+// The SoA batch overload is gated on `output_dim > 1`. For scalar
+// outputs, AoS and SoA coincide — users pass `value_type*` directly.
 
 TEST_CASE("Batch vs single evaluation agree -- 3D scalar output", "[baobzi][batch][3d]") {
     auto f = [](std::array<double, 3> x) -> std::array<double, 1> {
@@ -727,12 +793,11 @@ TEST_CASE("eval_scatter_sorted counting-sort matches per-pair scalar",
 // Pin the leaf-table build threshold: fits that land at max_depth up
 // to 16 (in 1D) must still get a table — the descent fallback otherwise
 // drops IPC from ~4.5 to ~1.9 and lights up branch-mispredict (measured
-// in bench_pack_scatter on tanh500_deep / tanh1000_deep). Phase 1
-// widened the threshold from 14 to 16.
+// in bench_pack_scatter on tanh500_deep / tanh1000_deep).
 TEST_CASE("Leaf-table built at widened depth threshold",
           "[baobzi][leaf-table]") {
-    // tanh500 at tol=1e-12 deg=6 lands at depth ~16; depth 14 cap
-    // would skip the table here. Phase 1's bump to 16 covers it.
+    // tanh500 at tol=1e-12 deg=6 lands at depth ~16; the table threshold
+    // must cover that depth.
     auto fn = fit<6>([](double x) { return std::tanh(500.0 * x); },
                     -1.0, 1.0, /*tol=*/1e-12);
     REQUIRE(fn.all_subtrees_have_leaf_table());

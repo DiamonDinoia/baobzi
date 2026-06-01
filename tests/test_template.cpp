@@ -96,7 +96,7 @@ TEST_CASE("1D array->array evaluations", "[baobzi_template]") {
             for (std::size_t k = 0; k < 4; ++k) ref_sorted[i * 4 + k] = y[k];
         }
         std::vector<double> out_sorted(4 * N, 0.0);
-        fn(xs_sorted.data(), out_sorted.data(), N, baobzi::Sorted);
+        fn.sorted(xs_sorted.data(), out_sorted.data(), N);
         for (std::size_t i = 0; i < 4 * N; ++i)
             REQUIRE(out_sorted[i] == ref_sorted[i]);
     }
