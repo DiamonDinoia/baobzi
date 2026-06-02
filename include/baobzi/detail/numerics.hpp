@@ -84,9 +84,9 @@ auto tail_error_below_tolerance(TolKind tol_type, double tol,
     scaling_factor = std::max(scaling_factor, std::abs(coeffs[N - 1]));
 
     if (tol_type == TolKind::RelativeL2 || tol_type == TolKind::RelativeMax)
-        return maxcoeff / scaling_factor > tol;
+        return static_cast<double>(maxcoeff / scaling_factor) > tol;
     else
-        return maxcoeff > tol;
+        return static_cast<double>(maxcoeff) > tol;
 }
 
 /// True when the maximum/L2 error of `polyfit` measured on a uniform
@@ -99,6 +99,10 @@ inline auto sample_error_below_tolerance(int n_sample_1d, TolKind tol_type, doub
                                          const Func &func, const Polyfit &polyfit) -> bool {
     constexpr std::size_t input_dim  = value_dim_v<typename Polyfit::InputType>;
     constexpr std::size_t output_dim = value_dim_v<typename Polyfit::OutputType>;
+    // Sample in the fit's own value type so a `float` fit never silently
+    // promotes its sample grid to double; the error metrics below still
+    // accumulate in double via explicit casts.
+    using T = poly_eval::detail::value_type_or_t<typename Polyfit::InputType>;
     const auto n_sample_1d_sz = static_cast<std::size_t>(n_sample_1d);
     const std::size_t n_samples = powi<static_cast<int>(input_dim)>(n_sample_1d_sz);
     const Value half_length = half_length_in;
@@ -109,26 +113,28 @@ inline auto sample_error_below_tolerance(int n_sample_1d, TolKind tol_type, doub
     double abs_err_l2{0.0};
     double direct_sum{0.0};
     for (std::size_t linear_index = 0; linear_index < n_samples; ++linear_index) {
-        Value<double, input_dim> sample_point;
+        Value<T, input_dim> sample_point;
         std::size_t curr_index = linear_index;
 
         for (std::size_t dim = 0; dim < input_dim; ++dim) {
-            const double dx = 2.0 * half_length[dim] / static_cast<double>(n_sample_1d_sz);
-            sample_point[dim] = center[dim] - half_length[dim] + dx / 2.0 +
-                                dx * static_cast<double>(curr_index % n_sample_1d_sz);
+            const T dx = T{2} * half_length[dim] / static_cast<T>(n_sample_1d_sz);
+            sample_point[dim] = center[dim] - half_length[dim] + dx / T{2} +
+                                dx * static_cast<T>(curr_index % n_sample_1d_sz);
             curr_index /= n_sample_1d_sz;
         }
 
-        Value<double, output_dim> actual = func(sample_point);
-        Value<double, output_dim> approx = polyfit(sample_point);
+        Value<T, output_dim> actual = func(sample_point);
+        Value<T, output_dim> approx = polyfit(sample_point);
 
         for (std::size_t i = 0; i < output_dim; ++i) {
-            const double abs_err = std::abs(approx[i] - actual[i]);
+            const double abs_err = std::abs(static_cast<double>(approx[i]) -
+                                            static_cast<double>(actual[i]));
             max_abs_err = std::max(max_abs_err, abs_err);
-            if (actual[i] != 0.0)
-                max_rel_err = std::max(max_rel_err, std::abs(abs_err / actual[i]));
+            if (actual[i] != T{0})
+                max_rel_err = std::max(
+                    max_rel_err, std::abs(abs_err / static_cast<double>(actual[i])));
             abs_err_l2 += powi<2>(abs_err);
-            direct_sum += powi<2>(actual[i]);
+            direct_sum += powi<2>(static_cast<double>(actual[i]));
         }
     }
 

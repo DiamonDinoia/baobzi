@@ -94,16 +94,50 @@ ctest --test-dir build
 Requirements: CMake ≥ 3.25, a C++20 compiler. polyfit / POET / Catch2 are
 pulled in via `FetchContent` (see `cmake/baobzi_deps.cmake`).
 
+## Language bindings
+
+A C ABI (`libbaobzi_c`, header [`include/baobzi.h`](include/baobzi.h)) plus
+**Python**, **Julia**, and **MATLAB** wrappers live under
+[`bindings/`](bindings/). Each lets you fit using a function handle written in
+the host language and surfaces C++ fit failures as native exceptions. They are
+opt-in CMake options (all default OFF):
+
+```bash
+cmake -S . -B build -DBAOBZI_BUILD_PYTHON=ON -DBAOBZI_BUILD_JULIA=ON -DBAOBZI_BUILD_MATLAB=ON
+ctest --test-dir build -R "python_baobzi|julia_baobzi|matlab_baobzi"
+```
+
+Missing toolchains are skipped gracefully. See [`bindings/README.md`](bindings/README.md)
+for per-language build/usage, the cross-language parity check, and notes.
+
 ## Including in your CMake project
+
+baobzi exposes two surfaces, with different consumption paths:
+
+**C ABI (`libbaobzi_c`) — installable, `find_package`-able.** Install baobzi
+(`cmake --install`) and link the namespaced target. It is self-contained
+(only needs the installed `baobzi.h`):
+
+```cmake
+find_package(baobzi REQUIRED)
+target_link_libraries(your_target PRIVATE baobzi::baobzi_c)         # shared
+# or baobzi::baobzi_c_static for the static archive
+```
+
+**C++ header-only template API — in-tree only.** The `baobzi::baobzi` target
+carries the `include/` tree and links polyfit/POET transitively, so just link
+it (no manual include dirs or polyfit/poet lines):
 
 ```cmake
 add_subdirectory(extern/baobzi)      # or FetchContent_Declare(baobzi ...)
-target_link_libraries(your_target PUBLIC polyfit::polyfit poet::poet)
-target_include_directories(your_target PRIVATE extern/baobzi/include)
+target_link_libraries(your_target PRIVATE baobzi::baobzi)
 ```
 
-Baobzi itself is header-only; polyfit and POET provide the leaf evaluators
-and compile-time dispatch.
+The C++ template API is *not* part of the installed `find_package(baobzi)`
+package: it instantiates against polyfit/POET headers, which are
+FetchContent-only (not separately installable). So consume it via
+`add_subdirectory` / `FetchContent` (where those deps resolve), and use the
+installed package for the C ABI.
 
 ## Driving the SIMD-quantize fast path
 

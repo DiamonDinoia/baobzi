@@ -19,6 +19,9 @@ target_link_libraries(baobzi_microbench PRIVATE nanobench)
 _baobzi_add_cpp_example(baobzi_bench_pack_scatter
                         examples/c++/baobzi_bench_pack_scatter.cpp)
 target_link_libraries(baobzi_bench_pack_scatter PRIVATE nanobench)
+_baobzi_add_cpp_example(baobzi_bench_sorted
+                        examples/c++/baobzi_bench_sorted.cpp)
+target_link_libraries(baobzi_bench_sorted PRIVATE nanobench)
 _baobzi_add_cpp_example(bench_scratch_gate examples/c++/bench_scratch_gate.cpp)
 target_link_libraries(bench_scratch_gate PRIVATE nanobench)
 _baobzi_add_cpp_example(baobzi_perf_driver examples/c++/baobzi_perf_driver.cpp)

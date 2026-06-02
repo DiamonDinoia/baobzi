@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "baobzi"
+version = "0.0.0"
+description = "Python bindings for the baobzi piecewise-Chebyshev approximator"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["baobzi"]
+
+[tool.scikit-build.cmake.define]
+BAOBZI_BUILD_EXAMPLES = "OFF"
+BAOBZI_BUILD_TESTS    = "OFF"

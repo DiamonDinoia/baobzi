@@ -133,7 +133,7 @@ class Function {
                     const Func &func)
         : input_(input),
           box_(dim_array_t{center}, dim_array_t{half_width_in}),
-          tol_(input.tol) {
+          tol_(static_cast<value_type>(input.tol)) {
         const auto t_start = std::chrono::steady_clock::now();
 
         // Surface a coarse memory-cost guard when the user opts into a
@@ -183,7 +183,7 @@ class Function {
             auto add_node_children_to_queue = [](std::queue<box_t> &theq, const dim_array_t &parent_center,
                                                  const dim_array_t &child_hw) {
                 for (std::size_t child = 0; child < n_child; ++child) {
-                    detail::Value<double, input_dim> offset_center;
+                    detail::Value<value_type, input_dim> offset_center;
 
                     // Extract sign of each offset component from the bits of child.
                     for (std::size_t j = 0; j < input_dim; ++j) {
@@ -233,8 +233,8 @@ class Function {
 
         dim_array_t bin_size;
         for (std::size_t j = 0; j < input_dim; ++j) {
-            bin_size[j] = 2.0 * box_.half_length[j] / static_cast<value_type>(n_subtrees_[j]);
-            inv_bin_size_[j] = 0.5 * static_cast<value_type>(n_subtrees_[j]) / box_.half_length[j];
+            bin_size[j] = value_type{2} * box_.half_length[j] / static_cast<value_type>(n_subtrees_[j]);
+            inv_bin_size_[j] = value_type{0.5} * static_cast<value_type>(n_subtrees_[j]) / box_.half_length[j];
         }
         lower_left_ = box_.center - box_.half_length;
         upper_right_ = box_.center + box_.half_length;

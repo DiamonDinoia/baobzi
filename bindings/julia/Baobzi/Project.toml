@@ -1,0 +1,10 @@
+name = "Baobzi"
+uuid = "b4e1b0a2-3c7f-4d9e-8a5f-2f6e1c3d7b89"
+version = "0.0.0"
+
+[deps]
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[compat]
+julia = "1.9"

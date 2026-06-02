@@ -30,3 +30,9 @@ _baobzi_add_cpp_test(test_threadsafe tests/test_threadsafe.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test_threadsafe PRIVATE Threads::Threads)
 _baobzi_add_cpp_test(test_allocator tests/test_allocator.cpp)
+
+# C ABI parity tests — link the C library built by baobzi_c_api.cmake.
+if(BAOBZI_BUILD_C_API)
+  _baobzi_add_cpp_test(test_c tests/test_c.cpp)
+  target_link_libraries(test_c PRIVATE baobzi_c)
+endif()

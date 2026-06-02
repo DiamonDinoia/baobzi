@@ -112,12 +112,15 @@ inline auto make_input(int input_dim, int output_dim, int degree,
 
 template <class Domain>
 inline auto midpoint(const Domain &a, const Domain &b) -> Domain {
+    // Scale by the domain's own element type so `float` corners stay in
+    // float arithmetic (a literal `0.5` would promote them to double).
     if constexpr (std::is_arithmetic_v<Domain>) {
-        return static_cast<Domain>(0.5 * (a + b));
+        return static_cast<Domain>(0.5) * (a + b);
     } else {
+        using elem_t = typename Domain::value_type;
         Domain out{};
         for (std::size_t i = 0; i < a.size(); ++i)
-            out[i] = 0.5 * (a[i] + b[i]);
+            out[i] = static_cast<elem_t>(0.5) * (a[i] + b[i]);
         return out;
     }
 }
@@ -125,11 +128,12 @@ inline auto midpoint(const Domain &a, const Domain &b) -> Domain {
 template <class Domain>
 inline auto half_length(const Domain &a, const Domain &b) -> Domain {
     if constexpr (std::is_arithmetic_v<Domain>) {
-        return static_cast<Domain>(0.5 * (b - a));
+        return static_cast<Domain>(0.5) * (b - a);
     } else {
+        using elem_t = typename Domain::value_type;
         Domain out{};
         for (std::size_t i = 0; i < a.size(); ++i)
-            out[i] = 0.5 * (b[i] - a[i]);
+            out[i] = static_cast<elem_t>(0.5) * (b[i] - a[i]);
         return out;
     }
 }

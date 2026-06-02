@@ -2785,3 +2785,45 @@ Horner on the scalar path.
 
 Verification: 39/39 ctests pass on the Release build with the
 remap applied.
+
+## 2026-06-01 — function.hpp AoS/SoA dedup (perf-neutral refactor)
+
+Collapsed the duplicated unsorted-tile pipeline into shared helpers
+(`leaf_id_of`, `partition_into_leaves`, `dispatch_packed_leaves`) plus a
+dead-code prune. Hot-path codegen verified before/after (GCC 15.2,
+`-O3 -march=native`, 1D `Function<8, double(*)(double)>`):
+
+- scalar `operator()(x)`     — **IDENTICAL**
+- `sorted(xp,res,n)`         — **IDENTICAL**
+- AoS `operator()(xp,res,n)` — **provably equivalent** (4 cosmetic register/
+  operand swaps; same 2619-instruction stream)
+
+Two further dedups (eval_batch driver "§4", `sorted_scan` "§5") were kept
+**reverted**: their objdump diff was large (587 / 875 lines) and the focused
+A/B sorted bench below could not certify neutrality on this powersave / no-sudo
+box.
+
+### sorted A/B — `baobzi_bench_sorted`, `taskset -c 2`, 3 interleaved reps (median)
+
+B = `sorted` reverted (shipped); A = `sorted_scan` re-applied. Core sampled at
+1.2–3.0 GHz (powersave; 4.8 GHz ceiling) — every cell MdAPE > 1%.
+
+| cell | B Mev/s | A Mev/s | A/B | maxerr% |
+|---|---|---|---|---|
+| 1d_runge deg=8 N=1e6        | 561.6 | 632.9 | 1.13 | 18.7 |
+| 1d_runge deg=8 N=1024       | 434.5 | 509.0 | 1.17 | 43.0 |
+| 1d_runge deg=8 N=32         | 163.1 | 159.5 | 0.98 | 18.1 |
+| 1d_tanh1000_deep deg=8 N=1e6  | 605.7 | 665.8 | 1.10 |  6.6 |
+| 1d_tanh1000_deep deg=8 N=1024 | 501.6 | 523.9 | 1.04 |  3.3 |
+| 1d_tanh1000_deep deg=8 N=32   | 248.4 | 247.7 | 1.00 |  4.2 |
+| 1d_tanh_sharp deg=10 N=1e6  | 548.6 | 543.6 | 0.99 |  9.2 |
+| 1d_tanh_sharp deg=10 N=1024 | 509.7 | 542.6 | 1.07 | 40.5 |
+| 1d_tanh_sharp deg=10 N=32   | 203.7 | 263.6 | 1.29 | 11.8 |
+
+**Verdict:** no cell clears MdAPE < 1% (powersave jitter; sudo freq-pinning
+declined), so the ±2%-on-stable-cells rule cannot be satisfied → §5 kept
+reverted. But there is **no systematic regression**: median A/B ≥ 1.0 on 7/9
+cells, and the two below (0.98, 0.99) sit inside their own 18 % / 9 % noise.
+Re-applying §5 is defensible if a quieter (performance-governor) machine
+later confirms ±2%. §4 is outer-wrapper-only (per-tile kernel unchanged, it
+dominates at N≥1024) — neutral by construction, also left reverted.

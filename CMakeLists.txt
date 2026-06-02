@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(baobzi LANGUAGES CXX)
+project(baobzi VERSION 0.0.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
 # User-facing options
@@ -88,6 +88,8 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 # ---------------------------------------------------------------------------
 include(dev_helpers)       # warnings / sanitizers / static analysis helpers
 include(baobzi_deps)       # fetch polyfit, POET, Catch2
+include(baobzi_c_api)      # C ABI (libbaobzi_c) — built before examples/tests
 include(baobzi_examples)   # C++ examples
 include(baobzi_tests)      # Catch2 suites
+include(baobzi_bindings)   # optional Python / Julia / MATLAB wrappers (default OFF)
 include(baobzi_install)    # install rules
